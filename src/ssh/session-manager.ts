@@ -223,8 +223,18 @@ export class SessionManager {
   }
 
   markAllDisconnected(): void {
+    // A session channel belongs to one SSH transport and cannot be resumed after that
+    // transport disconnects. Normally ssh2 emits `close` for every channel and the
+    // register() handler evicts each entry, but transport failures are exactly where we
+    // must not depend on a later per-channel event: a missing `close` used to leave a
+    // disconnected session in this Map forever, consuming a sessionMaxPerConnection slot.
+    //
+    // Clear after marking so any caller that still holds the Session object sees the
+    // truthful terminal state. A delayed close from the old channel remains safe because
+    // register() deletes only when the Map still points at that exact Session instance.
     for (const session of this.sessions.values()) {
       session.markDisconnected();
     }
+    this.sessions.clear();
   }
 }
