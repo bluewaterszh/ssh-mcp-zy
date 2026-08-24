@@ -90,6 +90,21 @@ describe('configurable session limits', () => {
     }
   });
 
+  it('rejects immediately when an interactive channel closes before the end marker', async () => {
+    const stream = Object.assign(new EventEmitter(), {
+      write: vi.fn(),
+      signal: vi.fn(),
+      end: vi.fn(),
+    }) as any;
+    const session = new InteractiveSession('id', 'shell', 'p', stream, 60_000, 1_800_000, 1024);
+    const pending = session.run('exit');
+    const rejected = expect(pending).rejects.toThrow(/closed before command completion/);
+
+    stream.emit('close');
+
+    await rejected;
+  });
+
   it('bounds background output with the configured byte cap', () => {
     const stream = new EventEmitter() as any;
     const session = new BackgroundSession('id', 'bg', 'p', stream, 60_000, undefined, 10);

@@ -181,12 +181,14 @@ export class InteractiveSession extends Session {
       let resolved = false;
       // Assigned below; declared here so every settle path can detach it.
       let detachAbort = () => { /* no abort signal */ };
+      let detachStream = () => { /* no per-run stream terminal listeners */ };
 
       const timeoutId = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.stream.removeListener('data', dataHandler);
           detachAbort();
+          detachStream();
           try { this.stream.write('\x03'); } catch { /* */ }
           setTimeout(() => { try { this.stream.signal('TERM'); } catch { /* */ } }, 500);
           span.end();
@@ -224,6 +226,7 @@ export class InteractiveSession extends Session {
           clearTimeout(timeoutId);
           this.stream.removeListener('data', dataHandler);
           detachAbort();
+          detachStream();
 
           const exitCode = parseInt(match[1]);
           const reportedCwd = match[2].trim();
@@ -275,6 +278,7 @@ export class InteractiveSession extends Session {
             resolved = true;
             clearTimeout(timeoutId);
             this.stream.removeListener('data', dataHandler);
+            detachStream();
             try { this.stream.write('\x03'); } catch { /* */ }
             setTimeout(() => { try { this.stream.signal('TERM'); } catch { /* */ } }, 1000);
             span.end();
@@ -287,6 +291,33 @@ export class InteractiveSession extends Session {
         detachAbort = () => abortSignal.removeEventListener('abort', onAbort);
       }
 
+      const onPrematureClose = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeoutId);
+        this.stream.removeListener('data', dataHandler);
+        detachAbort();
+        detachStream();
+        span.end();
+        reject(new Error(`Interactive session ${this.name} closed before command completion`));
+      };
+      const onStreamError = (err: Error) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeoutId);
+        this.stream.removeListener('data', dataHandler);
+        detachAbort();
+        detachStream();
+        this._status = 'disconnected';
+        span.end();
+        reject(new Error(`Interactive session ${this.name} failed before command completion: ${err.message}`));
+      };
+      detachStream = () => {
+        this.stream.removeListener('close', onPrematureClose);
+        this.stream.removeListener('error', onStreamError);
+      };
+      this.stream.once('close', onPrematureClose);
+      this.stream.once('error', onStreamError);
       this.stream.on('data', dataHandler);
       // One line, so the PTY produces exactly one echo and it necessarily
       // precedes the begin marker's output. Written as three lines, the shell
