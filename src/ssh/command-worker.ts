@@ -3,7 +3,7 @@ import { randomBytes } from 'crypto';
 import type { CommandResult, ExecOpts } from '../types.js';
 import { shellSingleQuote, validateRemotePath } from '../guard/sanitizer.js';
 import { redactText } from '../guard/redactor.js';
-import { terminateChannel } from './channel-signal.js';
+import { terminateChannel, waitForChannelClose } from './channel-signal.js';
 import { timingLog } from '../observability/timing.js';
 
 const HANDSHAKE_TIMEOUT_MS = 1_000;
@@ -105,8 +105,9 @@ export interface CommandWorkerRunOpts extends ExecOpts {
 export class CommandWorker {
   private busy = false;
   private closed = false;
-  private deferActiveRelease = false;
   private shellPath = '';
+  private closing: Promise<void> | null = null;
+  private closeNotified = false;
 
   private constructor(
     private readonly stream: ClientChannel,
@@ -114,12 +115,18 @@ export class CommandWorker {
     private readonly maxOutputChars: number,
     private readonly defaultTimeoutMs: number,
     private readonly onClosed: () => void,
-    private readonly onRunStart: () => void,
-    private readonly onRunEnd: () => void,
+    private readonly beginRun: () => () => void,
   ) {
     stream.once('close', () => {
       this.closed = true;
-      this.onClosed();
+      this.notifyClosed();
+    });
+    // A persistent channel can emit error while no command-specific listener is
+    // attached. Keep one permanent listener so an idle worker error cannot become
+    // an uncaught EventEmitter 'error' and crash the whole MCP process.
+    stream.on('error', () => {
+      this.closed = true;
+      this.notifyClosed();
     });
   }
 
@@ -129,15 +136,21 @@ export class CommandWorker {
     maxOutputChars: number,
     defaultTimeoutMs: number,
     onClosed: () => void,
-    onRunStart: () => void,
-    onRunEnd: () => void,
+    beginRun: () => () => void,
   ): Promise<CommandWorker> {
     const worker = new CommandWorker(
       stream, profileName, maxOutputChars, defaultTimeoutMs,
-      onClosed, onRunStart, onRunEnd,
+      onClosed, beginRun,
     );
-    await worker.handshake();
-    return worker;
+    try {
+      await worker.handshake();
+      return worker;
+    } catch (err) {
+      // A failed POSIX/worker handshake must not leave the just-opened SSH
+      // channel behind merely because the caller will fall back to direct exec.
+      await worker.close().catch(() => {});
+      throw err;
+    }
   }
 
   get isAvailable(): boolean {
@@ -147,22 +160,43 @@ export class CommandWorker {
   tryRun(command: string, opts: CommandWorkerRunOpts = {}): Promise<CommandResult> | null {
     if (!this.isAvailable) return null;
     this.busy = true;
-    this.deferActiveRelease = false;
-    this.onRunStart();
+    const releaseRun = this.beginRun();
     return this.run(command, opts).finally(() => {
       this.busy = false;
-      if (!this.deferActiveRelease) this.onRunEnd();
+      releaseRun();
     });
   }
 
-  close(): void {
-    if (this.closed) return;
+  async close(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closing = this.closeInternal();
+    return this.closing;
+  }
+
+  private async closeInternal(): Promise<void> {
+    const wasBusy = this.busy;
     this.closed = true;
-    if (this.busy) {
+    this.notifyClosed();
+
+    if (wasBusy) {
       terminateChannel(this.stream);
-      return;
+    } else {
+      try { this.stream.end(); } catch { /* already closed */ }
     }
-    try { this.stream.end(); } catch { /* already closed */ }
+
+    // Do not leave a persistent worker channel behind if the peer never answers
+    // the close/signal ladder. Busy commands get the same bounded escalation
+    // budget as background-session shutdown; an idle shell gets a short grace.
+    const closed = await waitForChannelClose(this.stream, wasBusy ? 3500 : 1000);
+    if (!closed) {
+      try { this.stream.destroy(); } catch { /* already gone */ }
+    }
+  }
+
+  private notifyClosed(): void {
+    if (this.closeNotified) return;
+    this.closeNotified = true;
+    this.onClosed();
   }
 
   private async handshake(): Promise<void> {
@@ -265,19 +299,22 @@ export class CommandWorker {
         if (settled) return;
         settled = true;
         cleanup();
-        if (killWorker) {
-          this.closed = true;
-          this.deferActiveRelease = true;
-          this.stream.once('close', () => this.onRunEnd());
-          terminateChannel(this.stream);
-          this.onClosed();
-        }
-        timingLog('ssh.worker.run', {
-          profile: this.profileName,
-          outcome,
-          totalMs: Number((performance.now() - timingStarted).toFixed(3)),
-        });
-        reject(err);
+        const finish = async () => {
+          if (killWorker) {
+            // Hold the command's active-channel accounting until the worker has
+            // actually closed (or has been forcibly destroyed after a bounded
+            // wait). Otherwise the idle reaper could tear down the SSH transport
+            // before TERM/KILL is delivered, recreating the old orphan-process bug.
+            await this.close().catch(() => {});
+          }
+          timingLog('ssh.worker.run', {
+            profile: this.profileName,
+            outcome,
+            totalMs: Number((performance.now() - timingStarted).toFixed(3)),
+          });
+          reject(err);
+        };
+        void finish();
       };
       const maybeDone = () => {
         if (settled || !stdout.done || !stderr.done) return;

@@ -1,5 +1,4 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import { posix, win32 } from 'path';
 
 const CONTROL_CHARS = /[\r\n\u2028\u2029\x00]/g;
 const REMOTE_PATH_CONTROL_CHARS = /[\x00-\x1F\x7F\u2028\u2029]/;
@@ -59,38 +58,43 @@ function isWindowsAbsolute(path: string): boolean {
   return WINDOWS_DRIVE_ABSOLUTE.test(path) || WINDOWS_UNC_ABSOLUTE.test(path);
 }
 
-function normalizeWindowsRemotePath(path: string): string {
-  // SFTP on Windows OpenSSH accepts forward slashes. Emitting one canonical
-  // separator keeps audit/log output stable while win32 handles drive/UNC/..
-  // semantics independently of the OS on which ssh-mcp itself is running.
-  return win32.normalize(path).replace(/\\/g, '/');
+function windowsSeparators(path: string): string {
+  // Windows OpenSSH SFTP accepts forward slashes, and using one separator avoids
+  // leaking backslash ambiguity into logs/tool results. Do not collapse dot
+  // segments: remote symlinks/junctions can make lexical `..` rewriting change
+  // which object the server actually resolves.
+  return path.replace(/\\/g, '/');
+}
+
+function appendRemote(base: string, relative: string, windows: boolean): string {
+  const normalizedBase = windows ? windowsSeparators(base) : base;
+  const normalizedRelative = windows ? windowsSeparators(relative) : relative;
+  const separator = normalizedBase.endsWith('/') ? '' : '/';
+  return normalizedBase + separator + normalizedRelative;
 }
 
 /**
  * Resolve a remote file path without applying the local machine's path rules.
  *
- * Absolute POSIX and Windows paths stay absolute. Relative paths are resolved
- * against the profile workdir when one exists; otherwise they keep SFTP's
- * normal relative-to-server-home semantics. `..` is intentionally allowed:
- * workdir is a convenience CWD, not a sandbox (run-command can `cd ..` too).
+ * Absolute POSIX paths stay byte-for-byte intact; Windows absolute paths only
+ * canonicalize separators. Relative paths are anchored under profile.workdir
+ * when one exists. `.` and `..` are deliberately left for the remote SFTP
+ * server to resolve, preserving symlink/junction semantics. workdir is a CWD
+ * convenience, not a sandbox (run-command can `cd ..` too).
  */
 export function resolveRemotePath(path: unknown, workdir?: string, field = 'Remote path'): string {
   const input = validateRemotePath(path, field);
   const base = workdir === undefined ? undefined : validateRemotePath(workdir, 'profile workdir');
 
-  if (isWindowsAbsolute(input)) return normalizeWindowsRemotePath(input);
-  if (input.startsWith('/')) return posix.normalize(input);
+  if (isWindowsAbsolute(input)) return windowsSeparators(input);
+  if (input.startsWith('/')) return input;
 
   if (base) {
-    if (isWindowsAbsolute(base)) return normalizeWindowsRemotePath(win32.join(base, input));
-    if (base.startsWith('/')) return posix.normalize(posix.join(base, input));
-    return posix.normalize(posix.join(base, input));
+    return appendRemote(base, input, isWindowsAbsolute(base));
   }
 
-  // Without an explicit workdir, keep SFTP's existing relative semantics while
-  // still collapsing harmless ./ and duplicate POSIX separators. Windows SFTP
-  // callers can always use canonical C:/... absolute paths.
-  return posix.normalize(input);
+  // No workdir means normal SFTP relative-to-server-home semantics.
+  return input;
 }
 
 export function shellSingleQuote(s: string): string {

@@ -50,6 +50,10 @@ export interface Harness {
   setRemoteFile(path: string, content: string): void;
   getRemoteFile(path: string): string | undefined;
   setSftpReadHook(hook?: (path: string, readCount: number) => void): void;
+  sftpOpenCount(): number;
+  sftpCloseCount(): number;
+  channelOpenCount(): number;
+  channelCloseCount(): number;
   /** What the stubbed exec returns; override per test. */
   setExecResult(result: Partial<CommandResult>): void;
   /** Whether the client approves elicitation prompts. */
@@ -78,6 +82,10 @@ export async function createHarness(
   const remoteFiles = new Map<string, Buffer>();
   const sftpReadCounts = new Map<string, number>();
   let sftpReadHook: ((path: string, readCount: number) => void) | undefined;
+  let sftpOpens = 0;
+  let sftpCloses = 0;
+  let channelOpens = 0;
+  let channelCloses = 0;
   let approve = true;
   let closeOutcome: CloseOutcome = 'closed';
   let approvalPrompts = 0;
@@ -129,19 +137,21 @@ export async function createHarness(
       });
       return stream;
     },
-    end() {},
+    end() { sftpCloses++; },
   };
 
   const conn: any = {
     profile,
     async ensureConnected() {},
+    noteActivity() {},
+    noteChannelOpened() { channelOpens++; return () => { channelCloses++; }; },
     async exec(command: string, opts: any = {}) {
       execCalls.push({ command, stdin: opts.stdin });
       return makeResult(command);
     },
     getSudoPassword: () => 'sudo-secret',
     getClient: () => ({
-      sftp(cb: (err: Error | undefined, handle?: any) => void) { cb(undefined, fakeSftp); },
+      sftp(cb: (err: Error | undefined, handle?: any) => void) { sftpOpens++; cb(undefined, fakeSftp); },
     }),
     getSession: (name: string) => sessions.get(name),
     // Matches SSHConnection.listSessions(): Session objects, not SessionInfo —
@@ -208,6 +218,10 @@ export async function createHarness(
     setRemoteFile(path, content) { remoteFiles.set(path, Buffer.from(content)); },
     getRemoteFile(path) { return remoteFiles.get(path)?.toString('utf8'); },
     setSftpReadHook(hook) { sftpReadHook = hook; },
+    sftpOpenCount: () => sftpOpens,
+    sftpCloseCount: () => sftpCloses,
+    channelOpenCount: () => channelOpens,
+    channelCloseCount: () => channelCloses,
     setExecResult(result) { execResult = result; },
     setApproval(value) { approve = value; },
     setCloseOutcome(outcome) { closeOutcome = outcome; },

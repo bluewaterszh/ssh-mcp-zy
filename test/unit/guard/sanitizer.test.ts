@@ -43,29 +43,22 @@ describe('validateRemotePath', () => {
 
 describe('resolveRemotePath', () => {
   it('resolves POSIX relative paths against the profile workdir', () => {
-    expect(resolveRemotePath('src/../README.md', '/repo/project')).toBe('/repo/project/README.md');
+    expect(resolveRemotePath('./src/../a.ts', '/repo/project')).toBe('/repo/project/./src/../a.ts');
+    expect(resolveRemotePath('../shared/a.ts', '/repo/project')).toBe('/repo/project/../shared/a.ts');
   });
 
-  it('normalizes POSIX absolute paths without forcing them under workdir', () => {
-    expect(resolveRemotePath('/var/tmp/../log/app.log', '/repo')).toBe('/var/log/app.log');
+  it('preserves and normalizes absolute POSIX paths independently of the local OS', () => {
+    expect(resolveRemotePath('/repo//src/../a.ts', 'C:/ignored')).toBe('/repo//src/../a.ts');
   });
 
-  it('resolves Windows paths using Windows rules even when ssh-mcp runs elsewhere', () => {
-    expect(resolveRemotePath('src\\..\\README.md', 'C:\\repo\\project')).toBe('C:/repo/project/README.md');
-    expect(resolveRemotePath('D:\\tmp\\..\\x.txt', 'C:\\repo')).toBe('D:/x.txt');
+  it('handles Windows drive and UNC paths with remote Windows semantics', () => {
+    expect(resolveRemotePath('src\\..\\a.ts', 'C:\\repo\\project')).toBe('C:/repo/project/src/../a.ts');
+    expect(resolveRemotePath('C:\\repo\\src\\..\\a.ts', '/ignored')).toBe('C:/repo/src/../a.ts');
+    expect(resolveRemotePath('\\\\server\\share\\dir\\..\\a.ts')).toBe('//server/share/dir/../a.ts');
   });
 
-  it('normalizes UNC paths and keeps them absolute', () => {
-    expect(resolveRemotePath('\\\\server\\share\\dir\\..\\x.txt', 'C:\\repo'))
-      .toBe('//server/share/x.txt');
-  });
-
-  it('allows .. to escape workdir because workdir is not a sandbox', () => {
-    expect(resolveRemotePath('../../outside.txt', '/repo/project')).toBe('/outside.txt');
-  });
-
-  it('keeps relative-to-home semantics when no workdir is configured', () => {
-    expect(resolveRemotePath('./a/../b.txt')).toBe('b.txt');
+  it('keeps relative SFTP semantics when no workdir is configured', () => {
+    expect(resolveRemotePath('./dir/../a.ts')).toBe('./dir/../a.ts');
   });
 });
 

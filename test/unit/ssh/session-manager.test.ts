@@ -22,8 +22,7 @@ describe('SessionManager disconnect cleanup', () => {
       profile: () => profile,
       openShell: async () => fakeChannel(),
       openExec: async () => nextStream,
-      onChannelOpened() {},
-      onChannelClosed() {},
+      onChannelOpened() { return () => {}; },
     });
 
     const oldSession = await manager.open({ name: 'work', type: 'background', command: 'sleep 1' });

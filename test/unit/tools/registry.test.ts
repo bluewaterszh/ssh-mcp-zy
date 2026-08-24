@@ -55,6 +55,38 @@ describe('file path validation', () => {
   });
 });
 
+describe('SFTP workdir path semantics', () => {
+  it('resolves upload/download/edit relative paths against profile.workdir', async () => {
+    h = await createHarness({ workdir: '/repo/project' });
+
+    const up = await call('sftp-upload', { remotePath: 'out/../created.txt', content: 'created' });
+    expect(up.isError).toBeFalsy();
+    expect(h.getRemoteFile('/repo/project/out/../created.txt')).toBe('created');
+
+    h.setRemoteFile('/repo/project/./read.txt', 'read-me');
+    const down = await call('sftp-download', { remotePath: './read.txt' });
+    expect(down.isError).toBeFalsy();
+    expect(textOf(down)).toContain('read-me');
+
+    h.setRemoteFile('/repo/project/src/./a.txt', 'before');
+    const edit = await call('edit-file', {
+      edits: [{ path: 'src/./a.txt', oldText: 'before', newText: 'after' }],
+    });
+    expect(edit.isError).toBeFalsy();
+    expect(h.getRemoteFile('/repo/project/src/./a.txt')).toBe('after');
+  });
+
+  it('does not treat workdir as a sandbox; .. follows normal path semantics', async () => {
+    h = await createHarness({ workdir: '/repo/project' });
+    h.setRemoteFile('/repo/project/../shared.txt', 'before');
+    const res = await call('edit-file', {
+      edits: [{ path: '../shared.txt', oldText: 'before', newText: 'after' }],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(h.getRemoteFile('/repo/project/../shared.txt')).toBe('after');
+  });
+});
+
 describe('apply-patch', () => {
   it('sends patch content byte-for-byte over SSH stdin instead of embedding it in the command', async () => {
     h = await createHarness();
@@ -121,6 +153,36 @@ describe('edit-file', () => {
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/file changed|re-read\/retry/i);
     expect(h.getRemoteFile('/race.txt')).toBe('changed-by-other-agent\n');
+  });
+  it('uses one SFTP subsystem channel for a multi-file edit and closes it', async () => {
+    h = await createHarness();
+    h.setRemoteFile('/a.txt', 'A old');
+    h.setRemoteFile('/b.txt', 'B old');
+
+    const res = await call('edit-file', {
+      edits: [
+        { path: '/a.txt', oldText: 'old', newText: 'new' },
+        { path: '/b.txt', oldText: 'old', newText: 'new' },
+      ],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(h.sftpOpenCount()).toBe(1);
+    expect(h.sftpCloseCount()).toBe(1);
+    expect(h.channelOpenCount()).toBe(1);
+    expect(h.channelCloseCount()).toBe(1);
+  });
+
+  it('closes the shared SFTP channel when edit validation fails', async () => {
+    h = await createHarness();
+    h.setRemoteFile('/a.txt', 'no match here');
+    const res = await call('edit-file', {
+      edits: [{ path: '/a.txt', oldText: 'missing', newText: 'x' }],
+    });
+    expect(res.isError).toBe(true);
+    expect(h.sftpOpenCount()).toBe(1);
+    expect(h.sftpCloseCount()).toBe(1);
+    expect(h.channelOpenCount()).toBe(1);
+    expect(h.channelCloseCount()).toBe(1);
   });
 });
 

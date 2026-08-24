@@ -104,6 +104,43 @@ describe('SSHConnection persistent command worker', () => {
     await conn.close();
   });
 
+  it('invalidates old release tokens on reconnect so late closes cannot steal new slots', async () => {
+    const conn = await connect();
+    await conn.ensureConnected();
+    const releaseOld = conn.noteChannelOpened();
+    expect(conn.toInfo().activeChannels).toBe(1);
+
+    conn.getClient().emit('close');
+    expect(conn.toInfo().activeChannels).toBe(0);
+
+    // Simulate work on the next transport generation. A delayed close from the
+    // previous generation must not decrement this new slot.
+    const releaseNew = conn.noteChannelOpened();
+    expect(conn.toInfo().activeChannels).toBe(1);
+    releaseOld();
+    expect(conn.toInfo().activeChannels).toBe(1);
+    releaseNew();
+    expect(conn.toInfo().activeChannels).toBe(0);
+  });
+
+  it('uses one-shot exec for standalone background operators so they cannot pollute the worker', async () => {
+    const conn = await connect();
+    const result = await conn.exec('sleep 10 &');
+    expect(result.stdout).toBe('direct\n');
+    expect(workerOpenCalls).toBe(0);
+    expect(execCalls).toEqual(['sleep 10 &']);
+    await conn.close();
+  });
+
+  it('still allows common non-background ampersand syntax onto the worker', async () => {
+    const conn = await connect();
+    expect((await conn.exec('true && true')).stdout).toBe('worker\n');
+    expect((await conn.exec('echo x 2>&1')).stdout).toBe('worker\n');
+    expect(workerOpenCalls).toBe(1);
+    expect(execCalls).toEqual([]);
+    await conn.close();
+  });
+
   it('falls back to a one-shot exec instead of queueing behind a busy worker', async () => {
     const conn = await connect();
     const slow = conn.exec('slow');

@@ -184,7 +184,7 @@ If the worker is busy, another concurrent request falls back to a normal one-sho
 
 Set `SSH_MCP_TIMING=1` to emit per-call timing diagnostics to stderr. It is disabled by default and does not write to the audit log. The timing records split tool execution into policy, remote run, audit, and total time; worker records include `ssh.worker.open` / `ssh.worker.run`, while fallback exec records include connection reuse, channel-open, and remote-runtime time.
 
-Remote file paths are validated for control characters and unreasonable size before SFTP or shell-quoted workdir use. File-tool relative paths resolve against the selected profile's `workdir` when one is configured; POSIX and Windows/UNC paths are normalized with the corresponding remote path rules, independent of the OS running ssh-mcp. `workdir` is not a sandbox: `..` remains allowed and can resolve outside it. Legal path characters such as spaces, quotes, semicolons and dollar signs are preserved rather than treated as shell input.
+Remote file paths are validated for control characters and unreasonable size before SFTP or shell-quoted workdir use. File-tool relative paths resolve against the selected profile's `workdir` when one is configured. Path classification is independent of the OS running ssh-mcp: POSIX and Windows/UNC absolute paths are recognized explicitly, and Windows separators are canonicalized for SFTP. Dot segments such as `.` / `..` are deliberately left for the remote server to resolve so client-side normalization cannot change symlink/junction semantics. `workdir` is not a sandbox; `..` remains allowed. Legal path characters such as spaces, quotes, semicolons and dollar signs are preserved rather than treated as shell input.
 
 ```bash
 SSH_MCP_TIMING=1 ssh-mcp ...
@@ -544,7 +544,7 @@ See [SECURITY.md](./SECURITY.md) for the full threat model, vulnerability report
 - **Non-root** user in all examples
 - **TOFU** host key verification (accept on first connect, verify after)
 - **RFC 9142** algorithm allow-list (no SHA-1, no CBC, no ssh-rsa)
-- **exec()-only** (no persistent su shells — fixes PTY leak)
+- **No persistent privileged/su shells**; the optional command worker is unprivileged, non-PTY, bounded, and torn down with its SSH connection
 - **Sudo via stdin** (not argv — fixes process list leak)
 - **Sanitizer** strips CR/LF/NUL from all metadata
 - **3-layer redaction** (field → regex → entropy) on audit logs

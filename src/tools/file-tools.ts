@@ -95,112 +95,118 @@ export function registerFileTools(
           },
         },
         async (rt) => {
-          const sftp = new SftpClient(rt.conn);
+          const sftpClient = new SftpClient(rt.conn);
           const decoder = new TextDecoder('utf-8', { fatal: true });
           const files = new Map<string, { original: string; content: string; mode: number }>();
           let loadedBytes = 0;
 
-          for (const edit of safeEdits) {
-            let file = files.get(edit.path);
-            if (!file) {
-              const stat = await sftp.stat(edit.path);
-              if (!stat.isFile) throw new Error(`edit-file only supports regular files: ${edit.path}`);
-              loadedBytes += stat.size;
-              if (loadedBytes > applyPatchMaxBytes) {
+          // One edit-file call uses one SFTP subsystem channel. Opening an SFTP
+          // subsystem is itself an SSH channel open, which is expensive on some
+          // targets; reopening it for every stat/read/recheck/write multiplied
+          // latency and amplified channel-churn failures.
+          return sftpClient.withSession(async (sftp) => {
+            for (const edit of safeEdits) {
+              let file = files.get(edit.path);
+              if (!file) {
+                const stat = await sftp.stat(edit.path);
+                if (!stat.isFile) throw new Error(`edit-file only supports regular files: ${edit.path}`);
+                loadedBytes += stat.size;
+                if (loadedBytes > applyPatchMaxBytes) {
+                  throw new Error(
+                    `Files selected for editing exceed the ${applyPatchMaxBytes} byte in-memory limit.`,
+                  );
+                }
+                const data = await sftp.download({ remotePath: edit.path, maxBytes: applyPatchMaxBytes });
+                let content: string;
+                try {
+                  content = decoder.decode(data);
+                } catch {
+                  throw new Error(`edit-file only supports UTF-8 text files: ${edit.path}`);
+                }
+                file = { original: content, content, mode: stat.mode & 0o7777 };
+                files.set(edit.path, file);
+              }
+
+              const matches = countOccurrences(file.content, edit.oldText);
+              if (matches !== 1) {
                 throw new Error(
-                  `Files selected for editing exceed the ${applyPatchMaxBytes} byte in-memory limit.`,
+                  `Expected oldText to match exactly once in ${edit.path}, found ${matches}. ` +
+                  'No files were changed.',
                 );
               }
-              const data = await sftp.download({ remotePath: edit.path, maxBytes: applyPatchMaxBytes });
-              let content: string;
-              try {
-                content = decoder.decode(data);
-              } catch {
-                throw new Error(`edit-file only supports UTF-8 text files: ${edit.path}`);
-              }
-              file = { original: content, content, mode: stat.mode & 0o7777 };
-              files.set(edit.path, file);
+              file.content = file.content.replace(edit.oldText, edit.newText);
             }
 
-            const matches = countOccurrences(file.content, edit.oldText);
-            if (matches !== 1) {
+            const outputBytes = [...files.values()].reduce(
+              (n, f) => n + Buffer.byteLength(f.content, 'utf8'), 0,
+            );
+            if (outputBytes > applyPatchMaxBytes) {
               throw new Error(
-                `Expected oldText to match exactly once in ${edit.path}, found ${matches}. ` +
-                'No files were changed.',
+                `Edited files would occupy ${outputBytes} bytes, exceeding the ${applyPatchMaxBytes} byte limit.`,
               );
             }
-            file.content = file.content.replace(edit.oldText, edit.newText);
-          }
 
-          const outputBytes = [...files.values()].reduce(
-            (n, f) => n + Buffer.byteLength(f.content, 'utf8'), 0,
-          );
-          if (outputBytes > applyPatchMaxBytes) {
-            throw new Error(
-              `Edited files would occupy ${outputBytes} bytes, exceeding the ${applyPatchMaxBytes} byte limit.`,
-            );
-          }
+            if (check) {
+              return {
+                audited: syntheticSuccess(rt.profileName),
+                output: textResult(`Edit check passed (${edits.length} replacements across ${files.size} files).`),
+              };
+            }
 
-          if (check) {
+            // Optimistic concurrency check: all edits were planned from the originals
+            // above. Re-read every file before the first write so a second MCP client
+            // cannot silently overwrite a change made while this call was validating.
+            for (const [path, file] of files) {
+              const currentData = await sftp.download({ remotePath: path, maxBytes: applyPatchMaxBytes });
+              let current: string;
+              try {
+                current = decoder.decode(currentData);
+              } catch {
+                throw new Error(`edit-file only supports UTF-8 text files: ${path}`);
+              }
+              if (current !== file.original) {
+                throw new Error(
+                  `Refusing to edit ${path}: the file changed while this edit-file call was preparing. ` +
+                  'No files were changed; re-read/retry against the current content.',
+                );
+              }
+            }
+
+            const attempted: string[] = [];
+            try {
+              for (const [path, file] of files) {
+                attempted.push(path);
+                await sftp.upload({ remotePath: path, content: file.content, mode: file.mode });
+              }
+            } catch (err) {
+              // If the shared SFTP channel itself failed, rollback through fresh
+              // channels so recovery does not depend on the channel that just broke.
+              const rollbackClient = new SftpClient(rt.conn);
+              const rollbackErrors: string[] = [];
+              for (const path of [...attempted].reverse()) {
+                const file = files.get(path)!;
+                try {
+                  await rollbackClient.upload({ remotePath: path, content: file.original, mode: file.mode });
+                } catch (rollbackErr) {
+                  rollbackErrors.push(
+                    `${path}: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+                  );
+                }
+              }
+              const cause = err instanceof Error ? err.message : String(err);
+              throw new Error(
+                `edit-file write failed: ${cause}.` +
+                (rollbackErrors.length
+                  ? ` Rollback was incomplete: ${rollbackErrors.join('; ')}`
+                  : ' Previously attempted files were rolled back.'),
+              );
+            }
+
             return {
               audited: syntheticSuccess(rt.profileName),
-              output: textResult(`Edit check passed (${edits.length} replacements across ${files.size} files).`),
+              output: textResult(`Applied ${edits.length} replacements across ${files.size} files.`),
             };
-          }
-
-          // Optimistic concurrency check: all edits were planned from the originals
-          // above. Re-read every file before the first write so a second MCP client
-          // cannot silently overwrite a change made while this call was validating a
-          // multi-file batch. There is intentionally no lock or new public version
-          // parameter; this narrows the race to the final check/write window while
-          // preserving the small, agent-friendly edit-file interface.
-          for (const [path, file] of files) {
-            const currentData = await sftp.download({ remotePath: path, maxBytes: applyPatchMaxBytes });
-            let current: string;
-            try {
-              current = decoder.decode(currentData);
-            } catch {
-              throw new Error(`edit-file only supports UTF-8 text files: ${path}`);
-            }
-            if (current !== file.original) {
-              throw new Error(
-                `Refusing to edit ${path}: the file changed while this edit-file call was preparing. ` +
-                'No files were changed; re-read/retry against the current content.',
-              );
-            }
-          }
-
-          const attempted: string[] = [];
-          try {
-            for (const [path, file] of files) {
-              attempted.push(path);
-              await sftp.upload({ remotePath: path, content: file.content, mode: file.mode });
-            }
-          } catch (err) {
-            const rollbackErrors: string[] = [];
-            for (const path of [...attempted].reverse()) {
-              const file = files.get(path)!;
-              try {
-                await sftp.upload({ remotePath: path, content: file.original, mode: file.mode });
-              } catch (rollbackErr) {
-                rollbackErrors.push(
-                  `${path}: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-                );
-              }
-            }
-            const cause = err instanceof Error ? err.message : String(err);
-            throw new Error(
-              `edit-file write failed: ${cause}.` +
-              (rollbackErrors.length
-                ? ` Rollback was incomplete: ${rollbackErrors.join('; ')}`
-                : ' Previously attempted files were rolled back.'),
-            );
-          }
-
-          return {
-            audited: syntheticSuccess(rt.profileName),
-            output: textResult(`Applied ${edits.length} replacements across ${files.size} files.`),
-          };
+          });
         },
       );
     },

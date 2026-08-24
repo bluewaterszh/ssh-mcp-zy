@@ -22,8 +22,8 @@ export interface SessionManagerDeps {
   profile(): Profile;
   openShell(): Promise<ClientChannel>;
   openExec(command: string): Promise<ClientChannel>;
-  onChannelOpened(): void;
-  onChannelClosed(): void;
+  /** Register a channel and return its idempotent release token. */
+  onChannelOpened(): () => void;
 }
 
 /** Owns the named sessions of a single SSH connection. */
@@ -68,10 +68,10 @@ export class SessionManager {
    */
   private register(name: string, session: Session, stream: ClientChannel): void {
     this.sessions.set(name, session);
-    this.deps.onChannelOpened();
+    const releaseChannel = this.deps.onChannelOpened();
 
     stream.on('close', () => {
-      this.deps.onChannelClosed();
+      releaseChannel();
       if (this.sessions.get(name) === session) this.sessions.delete(name);
     });
   }

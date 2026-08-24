@@ -7,12 +7,19 @@ class FakeChannel extends EventEmitter {
   writes: string[] = [];
   ended = false;
   autoComplete = true;
+  handshakeUnsupported = false;
 
   write(text: string) {
     this.writes.push(text);
     const ready = text.match(/SSHMCP_WORKER_READY_([A-Za-z0-9_-]+)/)?.[0];
     if (ready) {
-      queueMicrotask(() => this.emit('data', Buffer.from(`${ready}__/bin/bash\n`)));
+      queueMicrotask(() => {
+        if (this.handshakeUnsupported) {
+          this.emit('data', Buffer.from(`${ready.replace('READY', 'UNSUPPORTED')}\n`));
+        } else {
+          this.emit('data', Buffer.from(`${ready}__/bin/bash\n`));
+        }
+      });
       return true;
     }
 
@@ -27,7 +34,7 @@ class FakeChannel extends EventEmitter {
     return true;
   }
 
-  end() { this.ended = true; }
+  end() { this.ended = true; queueMicrotask(() => this.emit('close')); }
 }
 
 async function worker(channel = new FakeChannel(), maxOutput = 1024) {
@@ -40,8 +47,7 @@ async function worker(channel = new FakeChannel(), maxOutput = 1024) {
     maxOutput,
     60_000,
     closed,
-    starts,
-    ends,
+    () => { starts(); return () => ends(); },
   );
   return { instance, channel, starts, ends, closed };
 }
@@ -107,6 +113,31 @@ describe('CommandWorker', () => {
     expect(instance.isAvailable).toBe(true);
   });
 
+  it('does not accumulate per-run listeners across repeated reuse', async () => {
+    const { instance, channel } = await worker();
+    for (let i = 0; i < 50; i++) {
+      const result = await instance.tryRun(`echo ${i}`)!;
+      expect(result.exitCode).toBe(7);
+      expect(channel.listenerCount('data')).toBe(0);
+      expect(channel.stderr.listenerCount('data')).toBe(0);
+      // One permanent error listener protects an idle persistent channel.
+      expect(channel.listenerCount('error')).toBe(1);
+      // One permanent close listener owns lifecycle notification.
+      expect(channel.listenerCount('close')).toBe(1);
+    }
+  });
+
+  it('closes the channel when worker handshake is unsupported', async () => {
+    const channel = new FakeChannel();
+    channel.handshakeUnsupported = true;
+    const closed = vi.fn();
+    await expect(CommandWorker.create(
+      channel as any, 'p', 1024, 60_000, closed, () => () => {},
+    )).rejects.toThrow(/POSIX shell/i);
+    expect(channel.ended).toBe(true);
+    expect(closed).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the active-command count until an aborted worker channel really closes', async () => {
     const channel = new FakeChannel();
     const { instance, ends } = await worker(channel);
@@ -115,10 +146,30 @@ describe('CommandWorker', () => {
     const pending = instance.tryRun('slow', { abortSignal: ac.signal })!;
 
     ac.abort();
-    await expect(pending).rejects.toThrow(/aborted/i);
+    // Abort starts the kill ladder but does not release the logical active slot
+    // before the worker channel is actually gone.
+    await Promise.resolve();
     expect(ends).not.toHaveBeenCalled();
 
     channel.emit('close');
+    await expect(pending).rejects.toThrow(/aborted/i);
     expect(ends).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes an idle persistent channel and notifies its owner exactly once', async () => {
+    const { instance, channel, closed } = await worker();
+    await instance.close();
+    expect(channel.ended).toBe(true);
+    expect(closed).toHaveBeenCalledTimes(1);
+    expect(instance.isAvailable).toBe(false);
+  });
+
+  it('absorbs an idle channel error instead of leaving an uncaught EventEmitter error', async () => {
+    const { instance, channel, closed } = await worker();
+    expect(() => channel.emit('error', new Error('transport glitch'))).not.toThrow();
+    expect(instance.isAvailable).toBe(false);
+    expect(closed).toHaveBeenCalledTimes(1);
+    channel.emit('close');
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 });

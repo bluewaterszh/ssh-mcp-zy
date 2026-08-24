@@ -51,12 +51,31 @@ export function stopAndDescribe(
   return dispatched ? '' : COULD_NOT_SIGNAL;
 }
 
+/**
+ * Background jobs can outlive the child shell and keep the persistent worker's
+ * stdout/stderr descriptors open, contaminating later framed commands. Be
+ * conservative: any standalone `&` uses the legacy one-shot exec path. False
+ * positives inside quoted text only cost performance. `&&`, `&>` and `2>&1`
+ * are not background operators and remain worker-eligible.
+ */
+export function hasStandaloneBackgroundOperator(command: string): boolean {
+  for (let i = 0; i < command.length; i++) {
+    if (command[i] !== '&') continue;
+    const prev = i > 0 ? command[i - 1] : '';
+    const next = i + 1 < command.length ? command[i + 1] : '';
+    if (prev === '&' || next === '&' || prev === '>' || next === '>') continue;
+    return true;
+  }
+  return false;
+}
+
 export class SSHConnection {
   readonly profile: Profile;
   private client: Client | null = null;
   private credentials: ResolvedCredentials;
   private readonly sessions: SessionManager;
   private activeChannels = 0;
+  private channelGeneration = 0;
   private connecting: Promise<void> | null = null;
   private connected = false;
   private connectedAt: Date | null = null;
@@ -110,8 +129,7 @@ export class SSHConnection {
           );
         });
       },
-      onChannelOpened: () => { this.activeChannels++; },
-      onChannelClosed: () => { this.activeChannels--; },
+      onChannelOpened: () => this.noteChannelOpened(),
     });
   }
 
@@ -173,7 +191,12 @@ export class SSHConnection {
         if (!isCurrent()) return;
         this.connected = false;
         this.sessions.markAllDisconnected();
-        this.invalidateCommandWorker();
+        // The transport is gone, so no channel on it is active anymore even if
+        // ssh2 never emits per-channel close events. Late closes are saturation-
+        // safe and cannot drive the count negative.
+        this.activeChannels = 0;
+        this.channelGeneration++;
+        void this.invalidateCommandWorker();
         this.client = null;
         this.connectedAt = null;
         // Without clearing the timer here, a handshake that fails via a clean
@@ -243,6 +266,28 @@ export class SSHConnection {
     return this.credentials.sudoPassword;
   }
 
+  /** Internal channel/activity accounting shared by exec, sessions and SFTP. */
+  noteActivity(): void {
+    this.lastActivity = new Date();
+  }
+
+  noteChannelOpened(): () => void {
+    const generation = this.channelGeneration;
+    let released = false;
+    this.activeChannels++;
+    this.noteActivity();
+    return () => {
+      if (released) return;
+      released = true;
+      // A close from an old SSH transport must never decrement channels opened
+      // after reconnect. Transport-wide disconnect invalidates every token by
+      // advancing channelGeneration and resets the logical count to zero.
+      if (generation !== this.channelGeneration) return;
+      this.activeChannels = Math.max(0, this.activeChannels - 1);
+      this.noteActivity();
+    };
+  }
+
   /**
    * Prefix a command with the profile's working directory, if configured.
    * Applied here rather than at the tool layer so the string the policy engine
@@ -263,7 +308,13 @@ export class SSHConnection {
    * need a private stdin stream, and terminal semantics belong to named sessions.
    */
   async exec(rawCommand: string, opts: ExecOpts = {}): Promise<CommandResult> {
-    if (!opts.tty && !this.profile.tty && opts.stdin === undefined) {
+    // Refresh before opening any channel so an idle-reaper tick cannot close a
+    // connection in the small window between a new request and CHANNEL_SUCCESS.
+    this.noteActivity();
+    if (
+      !opts.tty && !this.profile.tty && opts.stdin === undefined &&
+      !hasStandaloneBackgroundOperator(rawCommand)
+    ) {
       const worker = await this.getOrCreateCommandWorker();
       const workdir = this.profile.workdir
         ? validateRemotePath(this.profile.workdir, 'Profile workdir')
@@ -338,8 +389,7 @@ export class SSHConnection {
             this.commandWorkerGeneration = null;
           }
         },
-        () => { this.activeChannels++; },
-        () => { this.activeChannels = Math.max(0, this.activeChannels - 1); },
+        () => this.noteChannelOpened(),
       );
       if (this.commandWorkerGeneration !== generation) {
         worker.close();
@@ -368,12 +418,12 @@ export class SSHConnection {
     }
   }
 
-  private invalidateCommandWorker(): void {
+  private async invalidateCommandWorker(): Promise<void> {
     const worker = this.commandWorker;
     this.commandWorker = null;
     this.commandWorkerOpening = null;
     this.commandWorkerGeneration = null;
-    worker?.close();
+    await worker?.close().catch(() => {});
   }
 
   private async execDirect(rawCommand: string, opts: ExecOpts = {}): Promise<CommandResult> {
@@ -425,6 +475,7 @@ export class SSHConnection {
 
     return new Promise((resolve, reject) => {
       let activeStream: ClientChannel | null = null;
+      let releaseChannel: (() => void) | null = null;
       let resolved = false;
 
       const timeoutId = setTimeout(() => {
@@ -485,7 +536,7 @@ export class SSHConnection {
         }
 
         activeStream = stream;
-        this.activeChannels++;
+        releaseChannel = this.noteChannelOpened();
         channelOpenedAt = performance.now();
 
         let stdout = '';
@@ -506,7 +557,8 @@ export class SSHConnection {
             // Decremented here rather than on 'close', because the close listener
             // below is never attached on this path. The channel now outlives the
             // count by as long as the kill ladder takes.
-            this.activeChannels--;
+            releaseChannel?.();
+            releaseChannel = null;
             // client.exec() has already dispatched the command, so rejecting
             // without signalling left it running to completion on the host and
             // held a channel until it finished. Closing the channel does not stop
@@ -549,7 +601,8 @@ export class SSHConnection {
         });
 
         stream.on('close', (code: number, signal: string) => {
-          this.activeChannels--;
+          releaseChannel?.();
+          releaseChannel = null;
           if (!resolved) {
             resolved = true;
             clearTimeout(timeoutId);
@@ -586,6 +639,7 @@ export class SSHConnection {
   // ─── Sessions (delegated to SessionManager) ──────────────────────────
 
   async openSession(opts: SessionOpts): Promise<Session> {
+    this.noteActivity();
     await this.ensureConnected();
     return this.sessions.open(opts);
   }
@@ -608,7 +662,7 @@ export class SSHConnection {
 
   async close(): Promise<void> {
     await this.sessions.closeAll();
-    this.invalidateCommandWorker();
+    await this.invalidateCommandWorker();
     if (this.client) {
       this.client.end();
       this.client = null;
