@@ -56,6 +56,7 @@ async function main() {
     );
     registerTools(server, registry, policy, audit, {
       approvalGrantTtlMs: config.defaults.approvalGrantTtlMs,
+      applyPatchMaxBytes: config.defaults.applyPatchMaxBytes,
     });
     registerResources(server, registry);
     return server;
@@ -70,6 +71,8 @@ async function main() {
       host: (argv.httpHost as string) || '127.0.0.1',
       bearerToken: argv.bearerToken as string | undefined,
       rateLimit: parseInt(argv.rateLimit as string) || 0,
+      maxBodyBytes: config.defaults.httpMaxBodyBytes,
+      sessionIdleTimeoutMs: config.defaults.httpSessionIdleTimeoutMs,
       allowedHosts: (argv.allowedHosts as string)?.split(',').map((h) => h.trim()).filter(Boolean),
       registry,
     });

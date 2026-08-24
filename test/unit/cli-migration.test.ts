@@ -43,10 +43,10 @@ describe('parseMaxChars', () => {
     expect(parseMaxChars('1234')).toBe(1234);
   });
 
-  it('falls back to the default for absent or unparseable values', () => {
-    expect(parseMaxChars(undefined)).toBe(5000);
-    expect(parseMaxChars(null)).toBe(5000);
-    expect(parseMaxChars('')).toBe(5000);
-    expect(parseMaxChars('abc')).toBe(5000);
+  it('defaults to unlimited for absent or unparseable values', () => {
+    expect(parseMaxChars(undefined)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(parseMaxChars(null)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(parseMaxChars('')).toBe(Number.MAX_SAFE_INTEGER);
+    expect(parseMaxChars('abc')).toBe(Number.MAX_SAFE_INTEGER);
   });
 });

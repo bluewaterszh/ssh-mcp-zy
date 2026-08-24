@@ -37,7 +37,9 @@ function startTestServer(): Promise<Server> {
         port: HTTP_PORT,
         host: HTTP_HOST,
         bearerToken: BEARER,
-        rateLimit: 3,
+        rateLimit: 5,
+        maxBodyBytes: 1_048_576,
+        sessionIdleTimeoutMs: 100,
         registry: mockRegistry,
       });
 
@@ -140,11 +142,10 @@ describe('HTTP transport — body size limit', () => {
   // The 413 must actually arrive before the socket dies, and must announce
   // Connection: close so a keep-alive client discards the socket instead of
   // pooling one the server is about to destroy (that poisoned the next test).
-  it('rejects body larger than 1MB with a 413 and closes the connection', async () => {
-    // Just over the cap: large enough to trip the limit, small enough that the
-    // client finishes writing before the server answers, so the assertion is
-    // about the 413 rather than about upload timing.
-    const largeBody = 'x'.repeat(1024 * 1024 + 1024);
+  it('enforces the configured body cap by UTF-8 bytes and closes the connection', async () => {
+    // 270k emoji are ~1.08 MB in UTF-8 but only 540k JS UTF-16 code units. This
+    // catches implementations that accidentally compare string length instead of bytes.
+    const largeBody = '🙂'.repeat(270_000);
     const res = await httpRequest(
       'POST',
       '/',
@@ -159,6 +160,30 @@ describe('HTTP transport — body size limit', () => {
 
 describe('HTTP transport — sessions', () => {
   const headers = { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+
+  it('reaps an idle MCP session when the client disappears without DELETE', async () => {
+    const init = await httpRequest('POST', '/', headers, JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18', capabilities: {},
+        clientInfo: { name: 'idle-reaper-test', version: '0.0.0' },
+      },
+    }));
+    expect(init.status).toBe(200);
+    const sessionId = init.headers['mcp-session-id'];
+    expect(typeof sessionId).toBe('string');
+
+    // No DELETE: this is the crash/network-loss path that used to retain the
+    // transport forever. The server in this file uses a 100ms test-only TTL.
+    await new Promise((r) => setTimeout(r, 180));
+
+    const stale = await httpRequest(
+      'POST', '/', { ...headers, 'mcp-session-id': sessionId as string },
+      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' }),
+    );
+    expect(stale.status).toBe(404);
+    expect(JSON.parse(stale.body).error.message).toMatch(/expired|not found/i);
+  });
 
   it('rejects a non-initialize POST that carries no session id', async () => {
     const res = await httpRequest('POST', '/', headers, JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }));

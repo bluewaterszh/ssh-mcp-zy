@@ -99,8 +99,12 @@ user = "test"
     const config = await loadConfig(path);
     const p = config.profiles[0];
     expect(p.approvalPolicy).toBe('ask-destructive');
-    expect(p.timeout).toBe(60_000);
-    expect(p.maxOutputBytes).toBe(1_048_576);
+    expect(p.timeout).toBe(1_800_000);
+    expect(p.maxChars).toBe(Number.MAX_SAFE_INTEGER);
+    expect(p.maxOutputBytes).toBe(8_388_608);
+    expect(config.defaults.httpMaxBodyBytes).toBe(16_777_216);
+    expect(config.defaults.httpSessionIdleTimeoutMs).toBe(600_000);
+    expect(config.defaults.applyPatchMaxBytes).toBe(16_777_216);
   });
 
   it('rejects unknown profile keys instead of silently dropping them', async () => {

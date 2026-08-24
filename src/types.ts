@@ -39,6 +39,9 @@ export interface Defaults {
   commandTimeoutMs: number;
   commandMaxChars: number;
   commandMaxOutputBytes: number;
+  httpMaxBodyBytes: number;
+  httpSessionIdleTimeoutMs: number;
+  applyPatchMaxBytes: number;
   connectionIdleReapMs: number;
   commandQuotaPerDay: number;
   /** Lifetime of a just-in-time approval grant; 0 = always prompt. */

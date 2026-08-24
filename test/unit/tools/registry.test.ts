@@ -14,7 +14,7 @@ describe('MCP tool surface', () => {
     h = await createHarness();
     const { tools } = await h.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'close-session', 'list-connections', 'list-sessions', 'open-session',
+      'apply-patch', 'close-session', 'list-connections', 'list-sessions', 'open-session',
       'privileged-command', 'read-command', 'read-session-output',
       'run-command', 'sftp-download', 'sftp-upload', 'signal-process',
     ]);
@@ -26,6 +26,30 @@ describe('MCP tool surface', () => {
     const readOnly = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
     // A mutating tool advertised as read-only invites auto-approval by clients.
     expect(readOnly).toEqual(['list-connections', 'list-sessions', 'read-command', 'read-session-output', 'sftp-download']);
+  });
+});
+
+describe('apply-patch', () => {
+  it('sends patch content byte-for-byte over SSH stdin instead of embedding it in the command', async () => {
+    h = await createHarness();
+    const patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new '$HOME' \\ path\n";
+    const res = await call('apply-patch', { patch, workdir: '/repo with space' });
+
+    expect(res.isError).toBeFalsy();
+    const exec = h.execCalls.at(-1)!;
+    expect(exec.command).toBe("git -C '/repo with space' apply --whitespace=nowarn -");
+    expect(exec.stdin).toBe(patch);
+    expect(exec.command).not.toContain('$HOME');
+    expect(textOf(res)).toContain(`Applied patch (${Buffer.byteLength(patch, 'utf8')} bytes)`);
+  });
+
+  it('rejects an oversized patch before opening a remote exec', async () => {
+    h = await createHarness({}, { applyPatchMaxBytes: 5 });
+    const res = await call('apply-patch', { patch: '123456' });
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/Patch is too large|applyPatchMaxBytes/i);
+    expect(h.execCalls).toHaveLength(0);
   });
 });
 

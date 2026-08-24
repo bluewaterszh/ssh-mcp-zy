@@ -82,10 +82,10 @@ export function checkRemovedFlags(argv: Record<string, string | null>): void {
  * with `parseInt(...) || 5000` silently turned that into a 5000-char cap.
  */
 export function parseMaxChars(raw: string | null | undefined): number {
-  if (typeof raw !== 'string' || raw === '') return 5_000;
+  if (typeof raw !== 'string' || raw === '') return Number.MAX_SAFE_INTEGER;
   if (raw.toLowerCase() === 'none') return Number.MAX_SAFE_INTEGER;
   const parsed = parseInt(raw);
-  if (isNaN(parsed)) return 5_000;
+  if (isNaN(parsed)) return Number.MAX_SAFE_INTEGER;
   return parsed <= 0 ? Number.MAX_SAFE_INTEGER : parsed;
 }
 
@@ -197,9 +197,12 @@ export async function buildAppConfig(argv: Record<string, string | null>): Promi
     sessionMaxPerConnection: parseInt(argv.sessionMax as string) || 5,
     sessionIdleTimeoutMs: parseInt(argv.sessionTtl as string) || 600_000,
     sessionBackgroundMaxMs: 3_600_000,
-    commandTimeoutMs: parseInt(argv.timeout as string) || 60_000,
+    commandTimeoutMs: parseInt(argv.timeout as string) || 1_800_000,
     commandMaxChars: parseMaxChars(argv.maxChars),
-    commandMaxOutputBytes: 1_048_576,
+    commandMaxOutputBytes: parseInt(argv.maxOutputBytes as string) || 8_388_608,
+    httpMaxBodyBytes: parseInt(argv.httpMaxBodyBytes as string) || 16_777_216,
+    httpSessionIdleTimeoutMs: parseInt(argv.httpSessionTtl as string) || 600_000,
+    applyPatchMaxBytes: parseInt(argv.applyPatchMaxBytes as string) || 16_777_216,
     connectionIdleReapMs: 900_000,
     commandQuotaPerDay: parseInt(argv.commandQuota as string) || 0,
     approvalGrantTtlMs: parseInt(argv.approvalGrantTtl as string) || 0,

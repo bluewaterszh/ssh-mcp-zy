@@ -11,6 +11,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   'privileged-command': 'Execute a command with sudo elevation. ALWAYS requires user approval. The sudo password is piped via stdin (never visible in process list).',
   'sftp-upload': 'Upload a file to the remote server via SFTP (secure file transfer, not shell-based).',
   'sftp-download': 'Download a file from the remote server via SFTP.',
+  'apply-patch': 'Apply a unified Git patch on the remote host. Patch content is sent over SSH stdin rather than embedded in a shell command, avoiding heredoc and quoting failures.',
   'signal-process': 'Send a signal (INT, TERM, KILL) to a remote process by PID.',
 };
 

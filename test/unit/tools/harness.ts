@@ -64,7 +64,7 @@ export interface Harness {
 
 export async function createHarness(
   overrides: Partial<Profile> = {},
-  toolOpts: { approvalGrantTtlMs?: number } = {},
+  toolOpts: { approvalGrantTtlMs?: number; applyPatchMaxBytes?: number } = {},
 ): Promise<Harness> {
   const profile: Profile = { ...testProfile, ...overrides };
   const execCalls: ExecCall[] = [];

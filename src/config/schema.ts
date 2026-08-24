@@ -23,12 +23,16 @@ export const defaultsSchema = z.object({
   sessionMaxPerConnection: z.number().int().positive().default(5),
   sessionIdleTimeoutMs: z.number().int().positive().default(600_000),
   sessionBackgroundMaxMs: z.number().int().positive().default(3_600_000),
-  commandTimeoutMs: z.number().int().positive().default(60_000),
+  commandTimeoutMs: z.number().int().positive().default(1_800_000),
   // 0 = unlimited, matching `--maxChars=none` on the CLI. normalizeConfig()
   // maps it to Number.MAX_SAFE_INTEGER so both surfaces hand the rest of the
-  // code an identical Profile.
-  commandMaxChars: z.number().int().nonnegative().default(5000),
-  commandMaxOutputBytes: z.number().int().positive().default(1_048_576),
+  // code an identical Profile. Coding-agent workloads often carry generated
+  // commands, so the default is intentionally uncapped.
+  commandMaxChars: z.number().int().nonnegative().default(0),
+  commandMaxOutputBytes: z.number().int().positive().default(8_388_608),
+  httpMaxBodyBytes: z.number().int().positive().default(16_777_216),
+  httpSessionIdleTimeoutMs: z.number().int().positive().default(600_000),
+  applyPatchMaxBytes: z.number().int().positive().default(16_777_216),
   connectionIdleReapMs: z.number().int().positive().default(900_000),
   // 0 = unlimited. A circuit breaker for runaway agents, not a rate limit.
   commandQuotaPerDay: z.number().int().nonnegative().default(0),

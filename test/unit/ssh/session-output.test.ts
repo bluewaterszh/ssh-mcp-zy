@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { trimNewlines, generateSessionMarker } from '../../../src/ssh/session.js';
+import { EventEmitter } from 'events';
+import { trimNewlines, generateSessionMarker, InteractiveSession, BackgroundSession } from '../../../src/ssh/session.js';
 
 describe('trimNewlines', () => {
   it('strips leading and trailing newlines but nothing in between', () => {
@@ -66,5 +67,35 @@ describe('generateSessionMarker', () => {
 
     expect(random).not.toHaveBeenCalled();
     expect(first).not.toBe(second);
+  });
+});
+
+
+describe('configurable session limits', () => {
+  it('uses the configured default command timeout for interactive sessions', async () => {
+    vi.useFakeTimers();
+    try {
+      const stream = Object.assign(new EventEmitter(), {
+        write: vi.fn(),
+        signal: vi.fn(),
+        end: vi.fn(),
+      }) as any;
+      const session = new InteractiveSession('id', 'shell', 'p', stream, 60_000, 25, 1024);
+      const timedOut = expect(session.run('sleep forever')).rejects.toThrow(/25ms/);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds background output with the configured byte cap', () => {
+    const stream = new EventEmitter() as any;
+    const session = new BackgroundSession('id', 'bg', 'p', stream, 60_000, undefined, 10);
+
+    stream.emit('data', Buffer.from('aaaa\nbbbb\ncccc\n'));
+
+    expect(session.readOutput(50)).toBe('bbbb\ncccc');
   });
 });

@@ -13,9 +13,12 @@ defaultProfile = "dev"            # Profile used when none is specified
 sessionMaxPerConnection = 5       # Max interactive+background sessions per host
 sessionIdleTimeoutMs = 600000     # 10min idle -> auto-close session
 sessionBackgroundMaxMs = 3600000  # 1hr max for background sessions
-commandTimeoutMs = 60000          # Per-command timeout
-commandMaxChars = 5000            # Max command length
-commandMaxOutputBytes = 1048576   # 1MB output cap per command
+commandTimeoutMs = 1800000        # 30min per-command timeout
+commandMaxChars = 0               # 0 = unlimited command length
+commandMaxOutputBytes = 8388608   # 8MB command/session output cap
+httpMaxBodyBytes = 16777216       # 16MB MCP HTTP request-body cap
+httpSessionIdleTimeoutMs = 600000 # 10min abandoned HTTP MCP session TTL
+applyPatchMaxBytes = 16777216     # 16MB maximum apply-patch payload
 connectionIdleReapMs = 900000     # 15min -> close idle connection
 approvalMode = "ask-destructive"  # auto | ask-destructive | ask-all | deny
 

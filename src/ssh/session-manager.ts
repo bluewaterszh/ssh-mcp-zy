@@ -84,7 +84,10 @@ export class SessionManager {
       throw new Error(`Failed to open interactive session: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    const session = new InteractiveSession(id, name, this.deps.profile().name, stream, ttlMs);
+    const profile = this.deps.profile();
+    const session = new InteractiveSession(
+      id, name, profile.name, stream, ttlMs, profile.timeout, profile.maxOutputBytes,
+    );
     this.register(name, session, stream);
     try {
       await this.primeShell(stream, session);
@@ -164,7 +167,7 @@ export class SessionManager {
 
     const profile = this.deps.profile();
     const session = new BackgroundSession(
-      id, name, profile.name, stream, ttlMs, profile.sessionBackgroundMaxMs,
+      id, name, profile.name, stream, ttlMs, profile.sessionBackgroundMaxMs, profile.maxOutputBytes,
     );
     this.register(name, session, stream);
     return session;

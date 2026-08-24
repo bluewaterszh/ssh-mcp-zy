@@ -46,6 +46,8 @@ export interface ToolDeps {
   server: McpServer;
   /** Lifetime of a just-in-time approval grant; 0 = always prompt. */
   approvalGrantTtlMs?: number;
+  /** Maximum patch payload accepted by apply-patch. */
+  applyPatchMaxBytes?: number;
   registry: ConnectionRegistry;
   policy: PolicyEngine;
   audit: AuditStore;

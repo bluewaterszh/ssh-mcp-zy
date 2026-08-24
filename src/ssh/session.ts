@@ -138,9 +138,16 @@ export abstract class Session {
 export class InteractiveSession extends Session {
   private stream: ClientChannel;
   private cwd = '~';
-  private static MAX_OUTPUT = 1_048_576;
 
-  constructor(id: string, name: string, profile: string, stream: ClientChannel, ttlMs: number) {
+  constructor(
+    id: string,
+    name: string,
+    profile: string,
+    stream: ClientChannel,
+    ttlMs: number,
+    private readonly defaultCommandTimeoutMs = 60_000,
+    private readonly maxOutputBytes = 1_048_576,
+  ) {
     super(id, name, profile, 'interactive', ttlMs);
     this.stream = stream;
     stream.on('close', () => {
@@ -148,7 +155,7 @@ export class InteractiveSession extends Session {
     });
   }
 
-  async run(command: string, timeoutMs = 60_000, abortSignal?: AbortSignal): Promise<CommandResult> {
+  async run(command: string, timeoutMs?: number, abortSignal?: AbortSignal): Promise<CommandResult> {
     if (this._status !== 'active') {
       throw new Error(`Session ${this.name} is not active (status: ${this._status})`);
     }
@@ -157,6 +164,7 @@ export class InteractiveSession extends Session {
     span.setAttribute('session.id', this.id);
     span.setAttribute('session.name', this.name);
 
+    const effectiveTimeoutMs = timeoutMs ?? this.defaultCommandTimeoutMs;
     const marker = this.generateMarker();
     // Split literals: the shell assembles these at runtime, so the *echoed*
     // command line never contains the assembled marker — only the command's
@@ -182,9 +190,9 @@ export class InteractiveSession extends Session {
           try { this.stream.write('\x03'); } catch { /* */ }
           setTimeout(() => { try { this.stream.signal('TERM'); } catch { /* */ } }, 500);
           span.end();
-          reject(new Error(`Command timed out after ${timeoutMs}ms in session ${this.name}`));
+          reject(new Error(`Command timed out after ${effectiveTimeoutMs}ms in session ${this.name}`));
         }
-      }, timeoutMs);
+      }, effectiveTimeoutMs);
 
       // The trailer carries the exit code and the shell's real CWD, so neither
       // has to be inferred (cwd used to be guessed from the command text, which
@@ -194,8 +202,12 @@ export class InteractiveSession extends Session {
       const dataHandler = (data: Buffer) => {
         const prevLength = buffer.length;
         buffer += data.toString();
-        if (buffer.length > InteractiveSession.MAX_OUTPUT * 2) {
-          buffer = buffer.slice(-InteractiveSession.MAX_OUTPUT * 2);
+        // Keep enough tail for the command output plus marker/trailer overhead. The
+        // configured profile output cap now governs interactive sessions too instead of
+        // a separate hard-coded 1MB constant.
+        const bufferLimit = this.maxOutputBytes + 4096;
+        if (buffer.length > bufferLimit) {
+          buffer = buffer.slice(-bufferLimit);
         }
 
         // The marker can only appear at the tail, so search the newly-arrived
@@ -227,7 +239,10 @@ export class InteractiveSession extends Session {
           const endIdx = afterBegin.indexOf(endMarker);
           const between = endIdx >= 0 ? afterBegin.slice(0, endIdx) : afterBegin;
 
-          const output = trimNewlines(between);
+          let output = trimNewlines(between);
+          if (output.length > this.maxOutputBytes) {
+            output = output.slice(-this.maxOutputBytes);
+          }
 
           if (reportedCwd) this.cwd = reportedCwd;
 
@@ -321,9 +336,16 @@ export class BackgroundSession extends Session {
   /** Tail of the last chunk when it did not end on a line boundary. */
   private partialLine = '';
   private exitCode: number | null = null;
-  private static RING_CHAR_LIMIT = 100_000;
 
-  constructor(id: string, name: string, profile: string, stream: ClientChannel, ttlMs: number, maxLifetimeMs?: number) {
+  constructor(
+    id: string,
+    name: string,
+    profile: string,
+    stream: ClientChannel,
+    ttlMs: number,
+    maxLifetimeMs?: number,
+    private readonly maxOutputBytes = 100_000,
+  ) {
     super(id, name, profile, 'background', ttlMs, maxLifetimeMs);
     this.stream = stream;
     stream.on('data', (data: Buffer) => {
@@ -365,7 +387,7 @@ export class BackgroundSession extends Session {
     let freed = 0;
 
     while (
-      this.ringBytes - freed > BackgroundSession.RING_CHAR_LIMIT &&
+      this.ringBytes - freed > this.maxOutputBytes &&
       dropCount < this.ringBuffer.length
     ) {
       freed += this.ringBuffer[dropCount].length + 1;

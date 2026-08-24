@@ -153,11 +153,11 @@ maxChars = 10
     expect(() => sanitizeCommand(LONG_COMMAND, maxChars)).toThrow(/too long/);
   });
 
-  it('the default cap is unchanged when nothing is set', async () => {
+  it('is unlimited by default when nothing is set', async () => {
     const maxChars = await maxCharsFor(PROFILE);
 
-    expect(maxChars).toBe(5000);
-    expect(() => sanitizeCommand(LONG_COMMAND, maxChars)).toThrow(/too long \(max 5000 characters\)/);
+    expect(maxChars).toBe(Number.MAX_SAFE_INTEGER);
+    expect(() => sanitizeCommand(LONG_COMMAND, maxChars)).not.toThrow();
   });
 });
 

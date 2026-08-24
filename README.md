@@ -131,7 +131,7 @@ claude mcp add --transport stdio ssh-mcp -- ssh-mcp
 
 ---
 
-## Tools (11)
+## Tools (12)
 
 | Tool | Purpose | readOnly | destructive |
 |------|---------|:--------:|:----------:|
@@ -143,6 +143,7 @@ claude mcp add --transport stdio ssh-mcp -- ssh-mcp
 | `read-command` | Execute allowlisted read-only commands (`ls`, `cat`, `grep`, ...) | ✅ | — |
 | `run-command` | Execute arbitrary commands (destructive ones need approval) | — | — |
 | `privileged-command` | Execute with sudo (always requires approval) | — | ✅ |
+| `apply-patch` | Apply a unified Git patch; patch bytes travel over SSH stdin, not shell quoting | — | ✅ |
 | `sftp-upload` | Upload a file via SFTP | — | ✅ |
 | `sftp-download` | Download a file via SFTP | ✅ | — |
 | `signal-process` | Send INT/TERM/KILL to a remote PID | — | ✅ |
@@ -202,9 +203,12 @@ defaultProfile = "dev"
 sessionMaxPerConnection = 5
 sessionIdleTimeoutMs = 600000       # 10min
 sessionBackgroundMaxMs = 3600000    # 1hr
-commandTimeoutMs = 60000
-commandMaxChars = 5000              # 0 = unlimited, the config spelling of --maxChars=none
-commandMaxOutputBytes = 1048576     # 1MB
+commandTimeoutMs = 1800000         # 30min
+commandMaxChars = 0                 # unlimited; set a positive cap to restrict it
+commandMaxOutputBytes = 8388608     # 8MB, also bounds session output buffers
+httpMaxBodyBytes = 16777216         # 16MB MCP HTTP request body
+httpSessionIdleTimeoutMs = 600000   # 10min; reaps clients that vanish without DELETE
+applyPatchMaxBytes = 16777216       # 16MB patch payload cap
 connectionIdleReapMs = 900000       # 15min
 commandQuotaPerDay = 0              # 0 = unlimited; circuit breaker for runaway agents
 approvalGrantTtlMs = 0              # 0 = always prompt; see "Approval Grants"
@@ -230,7 +234,9 @@ cert = false                        # SSH CA cert auth — auto-detects keyRef-c
 sessionMaxPerConnection = 3         # per-profile override
 sessionIdleTimeoutMs = 300000       # stricter for prod
 commandQuotaPerDay = 200            # per-profile override
+timeout = 300000                     # per-profile command timeout override
 maxChars = 2000                     # per-profile override; stricter for prod
+maxOutputBytes = 2097152            # per-profile output/session-buffer cap
 
 # Optional. Merged over the built-in role matrix; see "Policy Engine" below.
 # roleBindings is keyed by role and then by tier, so the block below changes
@@ -561,6 +567,8 @@ ssh-mcp --transport=http --httpPort=3000 --bearerToken=secret --rateLimit=60
 | `--bearerToken` | required | Bearer token for authentication (all routes except `GET /health`) |
 | `--httpPort` | 3000 | HTTP listen port |
 | `--httpHost` | 127.0.0.1 | Bind address |
+| `--httpMaxBodyBytes` | 16777216 | Maximum MCP HTTP request body |
+| `--httpSessionTtl` | 600000 | Idle TTL for HTTP MCP sessions; abandoned clients are reaped |
 | `--rateLimit` | 0 (off) | Max requests per minute (0 = unlimited) |
 
 Endpoints: `POST /` (MCP Streamable HTTP), `GET /status`, `GET /health`
@@ -607,13 +615,17 @@ Secrets are **never** passed as CLI arguments.
 | `--key` | — | Quick start: Path to private key |
 | `--workdir` | — | Quick start: Working directory for commands and sessions |
 | `--group` | prod | Quick start: Policy tier — `prod`, `staging` or `dev` |
-| `--timeout` | 60000 | Command timeout in ms |
-| `--maxChars` | 5000 | Max command length (`none` or `0` disables the limit; in a config file the same setting is `commandMaxChars = 0`) |
+| `--timeout` | 1800000 | Command timeout in ms (30min) |
+| `--maxChars` | none | Max command length (`none` or `0` disables the limit; config: `commandMaxChars = 0`) |
+| `--maxOutputBytes` | 8388608 | Command and session output-buffer cap |
 | `--sessionMax` | 5 | Max concurrent sessions per connection |
 | `--sessionTtl` | 600000 | Session idle timeout in ms |
 | `--transport` | stdio | `stdio` or `http` |
 | `--httpPort` | 3000 | HTTP transport port |
 | `--httpHost` | 127.0.0.1 | HTTP bind address |
+| `--httpMaxBodyBytes` | 16777216 | Maximum MCP HTTP request body |
+| `--httpSessionTtl` | 600000 | Idle TTL for HTTP MCP sessions; abandoned clients are reaped |
+| `--applyPatchMaxBytes` | 16777216 | Maximum `apply-patch` payload |
 | `--bearerToken` | — | Bearer token for HTTP transport auth (required for `--transport=http`) |
 | `--rateLimit` | 0 | HTTP requests per minute on the MCP route (0 = unlimited) |
 | `--allowedHosts` | bind address + localhost | Comma-separated Host headers accepted by the DNS-rebinding guard |
