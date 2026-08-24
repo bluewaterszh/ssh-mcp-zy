@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { TextDecoder } from 'util';
 import { redactText } from '../guard/redactor.js';
-import { shellSingleQuote } from '../guard/sanitizer.js';
+import { shellSingleQuote, resolveRemotePath } from '../guard/sanitizer.js';
 import { SftpClient } from '../ssh/sftp.js';
 import { TOOL_DESCRIPTIONS as D } from './descriptions.js';
 import { commandOutput, syntheticSuccess, textResult } from './results.js';
@@ -21,30 +21,33 @@ function countOccurrences(text: string, needle: string): number {
 
 /** SFTP transfer tools. */
 export function registerFileTools(
-  { server, applyPatchMaxBytes = 16_777_216 }: ToolDeps,
+  { server, registry, applyPatchMaxBytes = 16_777_216 }: ToolDeps,
   pipeline: Pipeline,
 ) {
-  const { runAudited } = pipeline;
+  const { runAudited, defaultProfileName } = pipeline;
+  const profileWorkdir = (profile?: string) =>
+    registry.getProfile(defaultProfileName(profile)).workdir;
 
   // ─── sftp-upload ───────────────────────────────────────────────────────
   server.tool(
     'sftp-upload',
     D["sftp-upload"],
     {
-      remotePath: z.string().describe('Remote file path'),
+      remotePath: z.string().describe('Remote file path; relative paths resolve against the profile workdir'),
       content: z.string().describe('File content to upload'),
       profile: z.string().optional().describe('Profile name'),
     },
     { destructiveHint: true },
     async ({ remotePath, content, profile }, extra) => {
+      const safePath = resolveRemotePath(remotePath, profileWorkdir(profile), 'remotePath');
       return runAudited(
-        `sftp:upload ${remotePath}`,
+        `sftp:upload ${safePath}`,
         { toolName: 'sftp-upload', failureClass: 'destructive', profile, extra, synthetic: true },
         async (rt) => {
-          await new SftpClient(rt.conn).upload({ remotePath, content });
+          await new SftpClient(rt.conn).upload({ remotePath: safePath, content });
           return {
             audited: syntheticSuccess(rt.profileName),
-            output: textResult(`Uploaded ${content.length} bytes to ${remotePath}`),
+            output: textResult(`Uploaded ${content.length} bytes to ${safePath}`),
           };
         },
       );
@@ -59,7 +62,7 @@ export function registerFileTools(
     D["edit-file"],
     {
       edits: z.array(z.object({
-        path: z.string().min(1).describe('Remote file path'),
+        path: z.string().min(1).describe('Remote file path; relative paths resolve against the profile workdir'),
         oldText: z.string().min(1).describe('Exact text that must occur once'),
         newText: z.string().describe('Replacement text'),
       })).min(1).max(128).describe('Exact replacements, applied in order'),
@@ -68,11 +71,15 @@ export function registerFileTools(
     },
     { destructiveHint: true },
     async ({ edits, check, profile }, extra) => {
-      const payloadBytes = edits.reduce(
+      const safeEdits = edits.map((edit) => ({
+        ...edit,
+        path: resolveRemotePath(edit.path, profileWorkdir(profile), 'edit path'),
+      }));
+      const payloadBytes = safeEdits.reduce(
         (n, e) => n + Buffer.byteLength(e.path) + Buffer.byteLength(e.oldText) + Buffer.byteLength(e.newText),
         0,
       );
-      const paths = [...new Set(edits.map((e) => e.path))];
+      const paths = [...new Set(safeEdits.map((e) => e.path))];
       const auditCommand = `sftp:edit ${paths.map((p) => JSON.stringify(p)).join(' ')}`;
 
       return runAudited(
@@ -93,7 +100,7 @@ export function registerFileTools(
           const files = new Map<string, { original: string; content: string; mode: number }>();
           let loadedBytes = 0;
 
-          for (const edit of edits) {
+          for (const edit of safeEdits) {
             let file = files.get(edit.path);
             if (!file) {
               const stat = await sftp.stat(edit.path);
@@ -139,6 +146,28 @@ export function registerFileTools(
               audited: syntheticSuccess(rt.profileName),
               output: textResult(`Edit check passed (${edits.length} replacements across ${files.size} files).`),
             };
+          }
+
+          // Optimistic concurrency check: all edits were planned from the originals
+          // above. Re-read every file before the first write so a second MCP client
+          // cannot silently overwrite a change made while this call was validating a
+          // multi-file batch. There is intentionally no lock or new public version
+          // parameter; this narrows the race to the final check/write window while
+          // preserving the small, agent-friendly edit-file interface.
+          for (const [path, file] of files) {
+            const currentData = await sftp.download({ remotePath: path, maxBytes: applyPatchMaxBytes });
+            let current: string;
+            try {
+              current = decoder.decode(currentData);
+            } catch {
+              throw new Error(`edit-file only supports UTF-8 text files: ${path}`);
+            }
+            if (current !== file.original) {
+              throw new Error(
+                `Refusing to edit ${path}: the file changed while this edit-file call was preparing. ` +
+                'No files were changed; re-read/retry against the current content.',
+              );
+            }
           }
 
           const attempted: string[] = [];
@@ -192,10 +221,13 @@ export function registerFileTools(
     },
     { destructiveHint: true },
     async ({ patch, workdir, check, profile }, extra) => {
+      const safeWorkdir = workdir
+        ? resolveRemotePath(workdir, profileWorkdir(profile), 'workdir')
+        : undefined;
       const bytes = Buffer.byteLength(patch, 'utf8');
       const command = [
         'git',
-        workdir ? `-C ${shellSingleQuote(workdir)}` : '',
+        safeWorkdir ? `-C ${shellSingleQuote(safeWorkdir)}` : '',
         'apply',
         check ? '--check' : '',
         '--recount',
@@ -249,11 +281,12 @@ export function registerFileTools(
     },
     { readOnlyHint: true },
     async ({ remotePath, profile }, extra) => {
+      const safePath = resolveRemotePath(remotePath, profileWorkdir(profile), 'remotePath');
       return runAudited(
-        `sftp:download ${remotePath}`,
+        `sftp:download ${safePath}`,
         { toolName: 'sftp-download', failureClass: 'read-only', profile, extra, synthetic: true },
         async (rt) => {
-          const data = await new SftpClient(rt.conn).download({ remotePath });
+          const data = await new SftpClient(rt.conn).download({ remotePath: safePath });
           return {
             audited: syntheticSuccess(rt.profileName),
             output: textResult(redactText(data.toString('utf8'), { entropyScan: true })),

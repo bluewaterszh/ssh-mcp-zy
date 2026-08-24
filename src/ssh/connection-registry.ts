@@ -107,7 +107,12 @@ export class ConnectionRegistry {
     for (const [name, conn] of this.connections) {
       if (viaTargets.has(name)) continue;
       const info = conn.toInfo();
-      if (info.sessionCount === 0 && info.lastActivity && info.lastActivity.getTime() < idleThreshold) {
+      if (
+        info.sessionCount === 0 &&
+        info.activeChannels === 0 &&
+        info.lastActivity &&
+        info.lastActivity.getTime() < idleThreshold
+      ) {
         conn.close().catch(() => {});
         this.connections.delete(name);
       }

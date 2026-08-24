@@ -102,9 +102,9 @@ function ssh2WillSend(ch: ClientChannel & ChannelInternals): boolean {
  * and no return value. Measured against 1.17.0: immediately after `client.end()`,
  * `sock.writable` is false while `outgoing.state` is still `'eof'`, so the state guard
  * below passes and the signal call returns without throwing. Reporting that as delivery
- * is #146 one layer down, and it is reachable whenever a connection is closed under a
- * running command — `SSHConnection.close()`, or the idle reaper, which does not consult
- * `activeChannels`.
+ * is #146 one layer down, and it is reachable whenever a connection is explicitly closed
+ * under a running command. The idle reaper now consults `activeChannels`, so it no longer
+ * tears a transport down underneath a live exec merely because `lastActivity` is old.
  *
  * All three of `isWritable`'s conjuncts, not just the first. The first version of this
  * checked `sock.writable` alone, and ssh2 added the other two for a reason

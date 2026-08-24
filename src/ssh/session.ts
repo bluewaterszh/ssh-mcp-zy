@@ -148,6 +148,8 @@ export class InteractiveSession extends Session {
   private ringMax = 10_000;
   /** Tail of the last chunk when it did not end on a line boundary. */
   private partialLine = '';
+  /** run-command returns its own framed output, so do not duplicate protocol traffic here. */
+  private captureMuted = false;
 
   constructor(
     id: string,
@@ -173,6 +175,7 @@ export class InteractiveSession extends Session {
   }
 
   private captureOutput(data: Buffer): void {
+    if (this.captureMuted) return;
     const text = this.partialLine + data.toString();
     const lines = text.split('\n');
     this.partialLine = lines.pop() ?? '';
@@ -218,7 +221,14 @@ export class InteractiveSession extends Session {
 
   readOutput(lines = 50): string {
     const all = this.partialLine ? [...this.ringBuffer, this.partialLine] : this.ringBuffer;
-    return all.slice(-lines).join('\n');
+    return stripAnsi(all.slice(-lines).join('\n'));
+  }
+
+  /** Discard shell startup/protocol noise after the session handshake completes. */
+  clearOutput(): void {
+    this.ringBuffer = [];
+    this.ringBytes = 0;
+    this.partialLine = '';
   }
 
   writeInput(input: string): void {
@@ -234,6 +244,7 @@ export class InteractiveSession extends Session {
       throw new Error(`Session ${this.name} is not active (status: ${this._status})`);
     }
 
+    this.captureMuted = true;
     const span = tracer.startSpan('ssh.session.run');
     span.setAttribute('session.id', this.id);
     span.setAttribute('session.name', this.name);
@@ -263,6 +274,7 @@ export class InteractiveSession extends Session {
           this.stream.removeListener('data', dataHandler);
           detachAbort();
           detachStream();
+          this.captureMuted = false;
           try { this.stream.write('\x03'); } catch { /* */ }
           setTimeout(() => { try { this.stream.signal('TERM'); } catch { /* */ } }, 500);
           span.end();
@@ -301,6 +313,7 @@ export class InteractiveSession extends Session {
           this.stream.removeListener('data', dataHandler);
           detachAbort();
           detachStream();
+          this.captureMuted = false;
 
           const exitCode = parseInt(match[1]);
           const reportedCwd = match[2].trim();
@@ -343,6 +356,7 @@ export class InteractiveSession extends Session {
         if (abortSignal.aborted) {
           resolved = true;
           clearTimeout(timeoutId);
+          this.captureMuted = false;
           span.end();
           reject(new Error('Command aborted before execution'));
           return;
@@ -353,6 +367,7 @@ export class InteractiveSession extends Session {
             clearTimeout(timeoutId);
             this.stream.removeListener('data', dataHandler);
             detachStream();
+            this.captureMuted = false;
             try { this.stream.write('\x03'); } catch { /* */ }
             setTimeout(() => { try { this.stream.signal('TERM'); } catch { /* */ } }, 1000);
             span.end();
@@ -372,6 +387,7 @@ export class InteractiveSession extends Session {
         this.stream.removeListener('data', dataHandler);
         detachAbort();
         detachStream();
+        this.captureMuted = false;
         span.end();
         reject(new Error(`Interactive session ${this.name} closed before command completion`));
       };
@@ -382,6 +398,7 @@ export class InteractiveSession extends Session {
         this.stream.removeListener('data', dataHandler);
         detachAbort();
         detachStream();
+        this.captureMuted = false;
         this._status = 'disconnected';
         span.end();
         reject(new Error(`Interactive session ${this.name} failed before command completion: ${err.message}`));

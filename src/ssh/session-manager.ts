@@ -131,6 +131,7 @@ export class SessionManager {
         settled = true;
         clearTimeout(timer);
         stream.removeListener('data', onData);
+        if (!err) session.clearOutput();
         err ? reject(err) : resolve();
       };
 

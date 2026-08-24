@@ -114,3 +114,38 @@ describe('configurable session limits', () => {
     expect(session.readOutput(50)).toBe('bbbb\ncccc');
   });
 });
+
+describe('interactive session output tail', () => {
+  it('clears priming noise and strips ANSI/OSC control sequences', () => {
+    const stream = Object.assign(new EventEmitter(), {
+      write: vi.fn(), signal: vi.fn(), end: vi.fn(),
+    }) as any;
+    const session = new InteractiveSession('id', 'shell', 'p', stream, 60_000, 60_000, 1024);
+
+    stream.emit('data', Buffer.from('\x1b]0;title\x07prime\r\n'));
+    expect(session.readOutput(10)).toBe('prime');
+    session.clearOutput();
+    expect(session.readOutput(10)).toBe('');
+
+    stream.emit('data', Buffer.from('\x1b]0;title\x07hello\r\n'));
+    expect(session.readOutput(10)).toBe('hello');
+  });
+
+  it('does not duplicate run-command framing/output into the terminal tail', async () => {
+    const stream = Object.assign(new EventEmitter(), {
+      write: vi.fn(), signal: vi.fn(), end: vi.fn(),
+    }) as any;
+    const session = new InteractiveSession('id', 'shell', 'p', stream, 60_000, 60_000, 1024);
+
+    const pending = session.run('echo command-output');
+    const wire = stream.write.mock.calls.at(-1)?.[0] as string;
+    const token = wire.match(/'_([A-Za-z0-9_-]{16})'/)?.[1];
+    expect(token).toBeTruthy();
+    stream.emit('data', Buffer.from(
+      `SSHMCP_BEG_${token}\ncommand-output\nSSHMCP_END_${token}__0__/tmp\n`,
+    ));
+
+    expect((await pending).stdout).toBe('command-output');
+    expect(session.readOutput(10)).toBe('');
+  });
+});

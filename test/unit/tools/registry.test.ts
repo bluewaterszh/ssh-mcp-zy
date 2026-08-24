@@ -36,6 +36,25 @@ describe('MCP tool surface', () => {
   });
 });
 
+describe('file path validation', () => {
+  it('rejects control-character paths before SFTP or exec opens', async () => {
+    h = await createHarness();
+    const uploaded = await call('sftp-upload', {
+      remotePath: '/tmp/good\nforged-log-line',
+      content: 'x',
+    });
+    expect(uploaded.isError).toBe(true);
+    expect(h.getRemoteFile('/tmp/good\nforged-log-line')).toBeUndefined();
+
+    const patched = await call('apply-patch', {
+      workdir: '/repo\nrm -rf /',
+      patch: 'diff --git a/a b/a\n',
+    });
+    expect(patched.isError).toBe(true);
+    expect(h.execCalls).toHaveLength(0);
+  });
+});
+
 describe('apply-patch', () => {
   it('sends patch content byte-for-byte over SSH stdin instead of embedding it in the command', async () => {
     h = await createHarness();
@@ -57,6 +76,51 @@ describe('apply-patch', () => {
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/Patch is too large|applyPatchMaxBytes/i);
     expect(h.execCalls).toHaveLength(0);
+  });
+});
+
+describe('edit-file', () => {
+  it('applies exact replacements and validates before writing', async () => {
+    h = await createHarness();
+    h.setRemoteFile('/a.txt', 'alpha old\n');
+    h.setRemoteFile('/b.txt', 'beta old\n');
+
+    const checked = await call('edit-file', {
+      check: true,
+      edits: [
+        { path: '/a.txt', oldText: 'old', newText: 'ONE' },
+        { path: '/b.txt', oldText: 'old', newText: 'TWO' },
+      ],
+    });
+    expect(checked.isError).toBeFalsy();
+    expect(h.getRemoteFile('/a.txt')).toBe('alpha old\n');
+
+    const applied = await call('edit-file', {
+      edits: [
+        { path: '/a.txt', oldText: 'old', newText: 'ONE' },
+        { path: '/b.txt', oldText: 'old', newText: 'TWO' },
+      ],
+    });
+    expect(applied.isError).toBeFalsy();
+    expect(h.getRemoteFile('/a.txt')).toBe('alpha ONE\n');
+    expect(h.getRemoteFile('/b.txt')).toBe('beta TWO\n');
+  });
+
+  it('refuses to overwrite a file that changed after the edit was planned', async () => {
+    h = await createHarness();
+    h.setRemoteFile('/race.txt', 'before\n');
+    h.setSftpReadHook((path, readCount) => {
+      if (path === '/race.txt' && readCount === 2) {
+        h.setRemoteFile('/race.txt', 'changed-by-other-agent\n');
+      }
+    });
+
+    const res = await call('edit-file', {
+      edits: [{ path: '/race.txt', oldText: 'before', newText: 'ours' }],
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/file changed|re-read\/retry/i);
+    expect(h.getRemoteFile('/race.txt')).toBe('changed-by-other-agent\n');
   });
 });
 

@@ -8,9 +8,10 @@ import type { Span } from '@opentelemetry/api';
 import { tracer } from '../observability/tracer.js';
 import { timingLog } from '../observability/timing.js';
 import { redactText } from '../guard/redactor.js';
-import { shellSingleQuote } from '../guard/sanitizer.js';
+import { shellSingleQuote, validateRemotePath } from '../guard/sanitizer.js';
 import { openWithRetry } from './channel-retry.js';
 import { terminateChannel, COULD_NOT_SIGNAL } from './channel-signal.js';
+import { CommandWorker, COMMAND_WORKER_BOOTSTRAP } from './command-worker.js';
 
 /**
  * Stop the command behind `channel`, record why on the span, and return the sentence the
@@ -63,6 +64,10 @@ export class SSHConnection {
   private knownHostsStore: Map<string, string>;
   private hostKeyMode: HostKeyMode;
   private bastionSock: ClientChannel | null;
+  private commandWorker: CommandWorker | null = null;
+  private commandWorkerOpening: Promise<CommandWorker | null> | null = null;
+  private commandWorkerGeneration: symbol | null = null;
+  private commandWorkerUnsupported = false;
 
   constructor(
     profile: Profile,
@@ -168,6 +173,7 @@ export class SSHConnection {
         if (!isCurrent()) return;
         this.connected = false;
         this.sessions.markAllDisconnected();
+        this.invalidateCommandWorker();
         this.client = null;
         this.connectedAt = null;
         // Without clearing the timer here, a handshake that fails via a clean
@@ -244,10 +250,133 @@ export class SSHConnection {
    */
   private applyWorkdir(command: string): string {
     if (!this.profile.workdir) return command;
-    return `cd ${shellSingleQuote(this.profile.workdir)} && ${command}`;
+    const workdir = validateRemotePath(this.profile.workdir, 'Profile workdir');
+    return `cd ${shellSingleQuote(workdir)} && ${command}`;
   }
 
+  /**
+   * A normal ssh2 exec channel is one-shot. On the measured OpenSSH target,
+   * opening the next channel costs ~1.8s even though the command itself takes
+   * ~1ms. Stateless commands therefore prefer one persistent non-PTY shell.
+   *
+   * stdin and PTY calls deliberately stay on the old path: patch/sudo payloads
+   * need a private stdin stream, and terminal semantics belong to named sessions.
+   */
   async exec(rawCommand: string, opts: ExecOpts = {}): Promise<CommandResult> {
+    if (!opts.tty && !this.profile.tty && opts.stdin === undefined) {
+      const worker = await this.getOrCreateCommandWorker();
+      const workdir = this.profile.workdir
+        ? validateRemotePath(this.profile.workdir, 'Profile workdir')
+        : undefined;
+      const pending = worker?.tryRun(rawCommand, { ...opts, workdir });
+      if (pending) {
+        const result = await pending;
+        this.lastActivity = new Date();
+        return result;
+      }
+    }
+    return this.execDirect(rawCommand, opts);
+  }
+
+  private async getOrCreateCommandWorker(): Promise<CommandWorker | null> {
+    if (this.commandWorker) return this.commandWorker;
+    if (this.commandWorkerUnsupported || this.commandWorkerOpening) return null;
+
+    const opening = this.openCommandWorker();
+    this.commandWorkerOpening = opening;
+    try {
+      return await opening;
+    } finally {
+      if (this.commandWorkerOpening === opening) this.commandWorkerOpening = null;
+    }
+  }
+
+  private async openCommandWorker(): Promise<CommandWorker | null> {
+    const generation = Symbol('command-worker');
+    this.commandWorkerGeneration = generation;
+    const started = performance.now();
+    let stream: ClientChannel;
+
+    try {
+      await this.ensureConnected();
+      const firstClient = this.getClient() as Client & { shell?: Client['shell'] };
+      if (typeof firstClient.shell !== 'function') {
+        this.commandWorkerGeneration = null;
+        this.commandWorkerUnsupported = true;
+        return null;
+      }
+      stream = await openWithRetry(async () => {
+        await this.ensureConnected();
+        const client = this.getClient();
+        return new Promise<ClientChannel>((resolve, reject) => {
+          client.exec(COMMAND_WORKER_BOOTSTRAP, {}, (err, channel) => err ? reject(err) : resolve(channel));
+        });
+      });
+    } catch (err) {
+      if (this.commandWorkerGeneration === generation) {
+        this.commandWorkerGeneration = null;
+        this.commandWorkerUnsupported = true;
+      }
+      timingLog('ssh.worker.open', {
+        profile: this.profile.name,
+        outcome: 'channel-open-error',
+        totalMs: Number((performance.now() - started).toFixed(3)),
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    try {
+      const worker = await CommandWorker.create(
+        stream,
+        this.profile.name,
+        this.profile.maxOutputBytes,
+        this.profile.timeout,
+        () => {
+          if (this.commandWorkerGeneration === generation) {
+            this.commandWorker = null;
+            this.commandWorkerGeneration = null;
+          }
+        },
+        () => { this.activeChannels++; },
+        () => { this.activeChannels = Math.max(0, this.activeChannels - 1); },
+      );
+      if (this.commandWorkerGeneration !== generation) {
+        worker.close();
+        return null;
+      }
+      this.commandWorker = worker;
+      timingLog('ssh.worker.open', {
+        profile: this.profile.name,
+        outcome: 'ready',
+        totalMs: Number((performance.now() - started).toFixed(3)),
+      });
+      return worker;
+    } catch (err) {
+      try { stream.end(); } catch { /* already closed */ }
+      if (this.commandWorkerGeneration === generation) {
+        this.commandWorkerGeneration = null;
+        this.commandWorkerUnsupported = true;
+      }
+      timingLog('ssh.worker.open', {
+        profile: this.profile.name,
+        outcome: 'handshake-error',
+        totalMs: Number((performance.now() - started).toFixed(3)),
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  private invalidateCommandWorker(): void {
+    const worker = this.commandWorker;
+    this.commandWorker = null;
+    this.commandWorkerOpening = null;
+    this.commandWorkerGeneration = null;
+    worker?.close();
+  }
+
+  private async execDirect(rawCommand: string, opts: ExecOpts = {}): Promise<CommandResult> {
     const totalStarted = performance.now();
     const connectStarted = performance.now();
     try {
@@ -479,6 +608,7 @@ export class SSHConnection {
 
   async close(): Promise<void> {
     await this.sessions.closeAll();
+    this.invalidateCommandWorker();
     if (this.client) {
       this.client.end();
       this.client = null;

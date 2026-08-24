@@ -176,9 +176,15 @@ Agent: read-session-output(name="logs-<uuid>", lines=20)   # poll
 Agent: close-session(name="logs-<uuid>")
 ```
 
-### Performance timing
+### Persistent command worker and timing
 
-Set `SSH_MCP_TIMING=1` to emit per-call timing diagnostics to stderr. It is disabled by default and does not write to the audit log. The timing records split tool execution into policy, remote run, audit, and total time; SSH exec records also include connection reuse, channel-open, and remote-runtime time.
+For ordinary commands with no explicit stdin and no PTY, ssh-mcp automatically keeps one persistent non-PTY exec worker per profile. The worker is opened once through the normal SSH exec path and executes each command in a fresh child of the user's configured shell. This preserves one-shot semantics (`cd`/`export` do not leak into the next command) while avoiding a new SSH exec channel for every call. `read-batch` and `run-batch` benefit automatically because sequential commands reuse the same worker.
+
+If the worker is busy, another concurrent request falls back to a normal one-shot exec rather than queueing behind it. Commands with stdin/TTY (including patch and sudo payloads) also stay on the normal exec path. Hosts that do not support the POSIX worker protocol, including the default Windows OpenSSH `cmd.exe` shell, are detected once and transparently use the original exec path.
+
+Set `SSH_MCP_TIMING=1` to emit per-call timing diagnostics to stderr. It is disabled by default and does not write to the audit log. The timing records split tool execution into policy, remote run, audit, and total time; worker records include `ssh.worker.open` / `ssh.worker.run`, while fallback exec records include connection reuse, channel-open, and remote-runtime time.
+
+Remote file paths are validated for control characters and unreasonable size before SFTP or shell-quoted workdir use. File-tool relative paths resolve against the selected profile's `workdir` when one is configured; POSIX and Windows/UNC paths are normalized with the corresponding remote path rules, independent of the OS running ssh-mcp. `workdir` is not a sandbox: `..` remains allowed and can resolve outside it. Legal path characters such as spaces, quotes, semicolons and dollar signs are preserved rather than treated as shell input.
 
 ```bash
 SSH_MCP_TIMING=1 ssh-mcp ...

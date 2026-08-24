@@ -2,6 +2,7 @@ import type { SFTPWrapper } from 'ssh2';
 import type { SftpUploadOpts, SftpDownloadOpts, SftpStat } from '../types.js';
 import type { SSHConnection } from './connection.js';
 import { openWithRetry } from './channel-retry.js';
+import { validateRemotePath } from '../guard/sanitizer.js';
 
 export class SftpClient {
   constructor(private conn: SSHConnection) {}
@@ -36,9 +37,10 @@ export class SftpClient {
   }
 
   async upload(opts: SftpUploadOpts): Promise<void> {
+    const remotePath = validateRemotePath(opts.remotePath, 'remotePath');
     return this.withSftp(async (sftp) => {
       return new Promise<void>((resolve, reject) => {
-        const stream = sftp.createWriteStream(opts.remotePath, { mode: opts.mode || 0o644 });
+        const stream = sftp.createWriteStream(remotePath, { mode: opts.mode || 0o644 });
         stream.on('error', reject);
         stream.on('close', resolve);
         stream.end(Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content));
@@ -55,16 +57,17 @@ export class SftpClient {
    * RSS and a multi-second event-loop stall for the entire server.
    */
   async download(opts: SftpDownloadOpts): Promise<Buffer> {
+    const remotePath = validateRemotePath(opts.remotePath, 'remotePath');
     const maxBytes = opts.maxBytes ?? this.conn.profile.maxOutputBytes;
 
     return this.withSftp(async (sftp) => {
       // Refuse before transferring anything when the size is known up front.
       const size = await new Promise<number | undefined>((resolve) => {
-        sftp.stat(opts.remotePath, (err, stats) => resolve(err ? undefined : stats?.size));
+        sftp.stat(remotePath, (err, stats) => resolve(err ? undefined : stats?.size));
       });
       if (size !== undefined && size > maxBytes) {
         throw new Error(
-          `Refusing to download ${opts.remotePath}: ${size} bytes exceeds the ${maxBytes} byte limit ` +
+          `Refusing to download ${remotePath}: ${size} bytes exceeds the ${maxBytes} byte limit ` +
           `(commandMaxOutputBytes). Narrow the file or raise the limit for this profile.`,
         );
       }
@@ -72,7 +75,7 @@ export class SftpClient {
       return new Promise<Buffer>((resolve, reject) => {
         const chunks: Buffer[] = [];
         let received = 0;
-        const stream = sftp.createReadStream(opts.remotePath);
+        const stream = sftp.createReadStream(remotePath);
         stream.on('data', (chunk: Buffer) => {
           received += chunk.length;
           // stat can be stale or unavailable (growing file, no permission), so
@@ -80,7 +83,7 @@ export class SftpClient {
           if (received > maxBytes) {
             stream.destroy();
             reject(new Error(
-              `Refusing to download ${opts.remotePath}: exceeded the ${maxBytes} byte limit while transferring.`,
+              `Refusing to download ${remotePath}: exceeded the ${maxBytes} byte limit while transferring.`,
             ));
             return;
           }
@@ -93,6 +96,7 @@ export class SftpClient {
   }
 
   async list(remotePath: string): Promise<SftpStat[]> {
+    remotePath = validateRemotePath(remotePath, 'remotePath');
     return this.withSftp(async (sftp) => {
       return new Promise<SftpStat[]>((resolve, reject) => {
         sftp.readdir(remotePath, (err: Error | undefined, list: any[]) => {
@@ -117,6 +121,7 @@ export class SftpClient {
   }
 
   async stat(remotePath: string): Promise<SftpStat> {
+    remotePath = validateRemotePath(remotePath, 'remotePath');
     return this.withSftp(async (sftp) => {
       return new Promise<SftpStat>((resolve, reject) => {
         sftp.stat(remotePath, (err: Error | undefined, stats: any) => {

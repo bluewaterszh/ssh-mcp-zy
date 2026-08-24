@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { EventEmitter } from 'events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -46,6 +47,9 @@ export interface Harness {
   execCalls: ExecCall[];
   auditRecords: any[];
   sessionInputs: string[];
+  setRemoteFile(path: string, content: string): void;
+  getRemoteFile(path: string): string | undefined;
+  setSftpReadHook(hook?: (path: string, readCount: number) => void): void;
   /** What the stubbed exec returns; override per test. */
   setExecResult(result: Partial<CommandResult>): void;
   /** Whether the client approves elicitation prompts. */
@@ -71,6 +75,9 @@ export async function createHarness(
   const execCalls: ExecCall[] = [];
   const auditRecords: any[] = [];
   const sessionInputs: string[] = [];
+  const remoteFiles = new Map<string, Buffer>();
+  const sftpReadCounts = new Map<string, number>();
+  let sftpReadHook: ((path: string, readCount: number) => void) | undefined;
   let approve = true;
   let closeOutcome: CloseOutcome = 'closed';
   let approvalPrompts = 0;
@@ -87,13 +94,55 @@ export async function createHarness(
 
   const sessions = new Map<string, any>();
 
+  const fakeSftp: any = {
+    stat(path: string, cb: (err: Error | undefined, stats?: any) => void) {
+      const data = remoteFiles.get(path);
+      if (!data) {
+        const err = Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+        cb(err);
+        return;
+      }
+      const now = Math.floor(Date.now() / 1000);
+      cb(undefined, { size: data.length, mode: 0o100644, mtime: now, atime: now });
+    },
+    createReadStream(path: string) {
+      const stream = Object.assign(new EventEmitter(), { destroy: () => {} });
+      const count = (sftpReadCounts.get(path) ?? 0) + 1;
+      sftpReadCounts.set(path, count);
+      sftpReadHook?.(path, count);
+      const data = remoteFiles.get(path);
+      queueMicrotask(() => {
+        if (!data) stream.emit('error', new Error(`ENOENT: ${path}`));
+        else {
+          stream.emit('data', Buffer.from(data));
+          stream.emit('close');
+        }
+      });
+      return stream;
+    },
+    createWriteStream(path: string) {
+      const stream = Object.assign(new EventEmitter(), {
+        end(content: string | Buffer) {
+          remoteFiles.set(path, Buffer.isBuffer(content) ? Buffer.from(content) : Buffer.from(content));
+          queueMicrotask(() => stream.emit('close'));
+        },
+      });
+      return stream;
+    },
+    end() {},
+  };
+
   const conn: any = {
     profile,
+    async ensureConnected() {},
     async exec(command: string, opts: any = {}) {
       execCalls.push({ command, stdin: opts.stdin });
       return makeResult(command);
     },
     getSudoPassword: () => 'sudo-secret',
+    getClient: () => ({
+      sftp(cb: (err: Error | undefined, handle?: any) => void) { cb(undefined, fakeSftp); },
+    }),
     getSession: (name: string) => sessions.get(name),
     // Matches SSHConnection.listSessions(): Session objects, not SessionInfo —
     // the handler calls toInfo() itself.
@@ -156,6 +205,9 @@ export async function createHarness(
     execCalls,
     auditRecords,
     sessionInputs,
+    setRemoteFile(path, content) { remoteFiles.set(path, Buffer.from(content)); },
+    getRemoteFile(path) { return remoteFiles.get(path)?.toString('utf8'); },
+    setSftpReadHook(hook) { sftpReadHook = hook; },
     setExecResult(result) { execResult = result; },
     setApproval(value) { approve = value; },
     setCloseOutcome(outcome) { closeOutcome = outcome; },
