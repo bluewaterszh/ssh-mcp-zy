@@ -1,28 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'events';
-import { CommandWorker } from '../../../src/ssh/command-worker.js';
+import { CommandWorker, COMMAND_WORKER_READY } from '../../../src/ssh/command-worker.js';
 
 class FakeChannel extends EventEmitter {
   stderr = new EventEmitter();
   writes: string[] = [];
   ended = false;
   autoComplete = true;
-  handshakeUnsupported = false;
 
   write(text: string) {
     this.writes.push(text);
-    const ready = text.match(/SSHMCP_WORKER_READY_([A-Za-z0-9_-]+)/)?.[0];
-    if (ready) {
-      queueMicrotask(() => {
-        if (this.handshakeUnsupported) {
-          this.emit('data', Buffer.from(`${ready.replace('READY', 'UNSUPPORTED')}\n`));
-        } else {
-          this.emit('data', Buffer.from(`${ready}__/bin/bash\n`));
-        }
-      });
-      return true;
-    }
-
     const markers = [...text.matchAll(/SSHMCP_W(?:OB|OE|EB|EE)_[A-Za-z0-9_-]+/g)].map((m) => m[0]);
     if (markers.length === 4 && this.autoComplete) {
       const [outBegin, errBegin, outEnd, errEnd] = markers;
@@ -41,6 +28,9 @@ async function worker(channel = new FakeChannel(), maxOutput = 1024) {
   const starts = vi.fn();
   const ends = vi.fn();
   const closed = vi.fn();
+  // READY comes from the remote bootstrap itself, before ssh-mcp writes any
+  // command bytes to the persistent channel.
+  queueMicrotask(() => channel.emit('data', Buffer.from(`${COMMAND_WORKER_READY}__/bin/bash\n`)));
   const instance = await CommandWorker.create(
     channel as any,
     'p',
@@ -127,13 +117,27 @@ describe('CommandWorker', () => {
     }
   });
 
-  it('closes the channel when worker handshake is unsupported', async () => {
+  it('does not require a client write to complete worker startup', async () => {
     const channel = new FakeChannel();
-    channel.handshakeUnsupported = true;
     const closed = vi.fn();
-    await expect(CommandWorker.create(
+    const creating = CommandWorker.create(
       channel as any, 'p', 1024, 60_000, closed, () => () => {},
-    )).rejects.toThrow(/POSIX shell/i);
+    );
+    expect(channel.writes).toEqual([]);
+    queueMicrotask(() => channel.emit('data', Buffer.from(`${COMMAND_WORKER_READY}__/bin/bash\n`)));
+    const instance = await creating;
+    expect(channel.writes).toEqual([]);
+    await instance.close();
+  });
+
+  it('closes the channel when worker startup proves unsupported', async () => {
+    const channel = new FakeChannel();
+    const closed = vi.fn();
+    const creating = CommandWorker.create(
+      channel as any, 'p', 1024, 60_000, closed, () => () => {},
+    );
+    queueMicrotask(() => channel.emit('close'));
+    await expect(creating).rejects.toThrow(/POSIX shell|closed during startup/i);
     expect(channel.ended).toBe(true);
     expect(closed).toHaveBeenCalledTimes(1);
   });

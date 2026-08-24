@@ -6,14 +6,15 @@ class WorkerChannel extends EventEmitter {
   stderr = new EventEmitter();
   writes: string[] = [];
 
+  constructor() {
+    super();
+    // The real worker bootstrap emits READY immediately after sshd accepts the
+    // exec request, before the client writes the first command frame.
+    setTimeout(() => this.emit('data', Buffer.from('SSHMCP_WORKER_READY_v1__/bin/bash\n')), 0);
+  }
+
   write(text: string) {
     this.writes.push(text);
-    const ready = text.match(/SSHMCP_WORKER_READY_([A-Za-z0-9_-]+)/)?.[0];
-    if (ready) {
-      queueMicrotask(() => this.emit('data', Buffer.from(`${ready}__/bin/bash\n`)));
-      return true;
-    }
-
     const markers = [...text.matchAll(/SSHMCP_W(?:OB|OE|EB|EE)_[A-Za-z0-9_-]+/g)].map((m) => m[0]);
     if (markers.length === 4) {
       const [outBegin, errBegin, outEnd, errEnd] = markers;

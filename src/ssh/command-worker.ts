@@ -1,24 +1,27 @@
 import type { ClientChannel } from 'ssh2';
 import { randomBytes } from 'crypto';
 import type { CommandResult, ExecOpts } from '../types.js';
-import { shellSingleQuote, validateRemotePath } from '../guard/sanitizer.js';
+import { shellSingleQuote } from '../guard/sanitizer.js';
 import { redactText } from '../guard/redactor.js';
 import { terminateChannel, waitForChannelClose } from './channel-signal.js';
 import { timingLog } from '../observability/timing.js';
 
-const HANDSHAKE_TIMEOUT_MS = 1_000;
+const HANDSHAKE_TIMEOUT_MS = 5_000;
 const PROGRESS_INTERVAL_MS = 500;
 
 // sshd already invokes an exec request through the user's configured shell with
 // `-c`. Keep that exact process/environment alive instead of using a `shell`
 // request (which OpenSSH turns into a login shell and may source different
-// profile files). The loop evaluates only ssh-mcp's fixed, quoted protocol
-// lines; caller commands remain single-quoted arguments to the user's shell.
+// profile files). The worker announces readiness immediately, then evaluates
+// only ssh-mcp's fixed, quoted protocol lines. Caller commands remain
+// single-quoted arguments to the user's configured shell.
+export const COMMAND_WORKER_READY = 'SSHMCP_WORKER_READY_v1';
 export const COMMAND_WORKER_BOOTSTRAP =
   '__sshmcp_shell="${SHELL:-}"; ' +
   'if [ -z "$__sshmcp_shell" ]; then __sshmcp_name="${0#-}"; ' +
   '__sshmcp_shell="$(command -v "$__sshmcp_name" 2>/dev/null || true)"; fi; ' +
   '[ -n "$__sshmcp_shell" ] && [ -x "$__sshmcp_shell" ] || exit 127; ' +
+  `printf '%s__%s\\n' '${COMMAND_WORKER_READY}' "$__sshmcp_shell"; ` +
   'while IFS= read -r __sshmcp_line; do eval "$__sshmcp_line"; done';
 
 function marker(): string {
@@ -200,9 +203,7 @@ export class CommandWorker {
   }
 
   private async handshake(): Promise<void> {
-    const token = marker();
-    const ready = `SSHMCP_WORKER_READY_${token}`;
-    const unsupported = `SSHMCP_WORKER_UNSUPPORTED_${token}`;
+    const ready = COMMAND_WORKER_READY;
     const started = performance.now();
 
     await new Promise<void>((resolve, reject) => {
@@ -220,47 +221,36 @@ export class CommandWorker {
       const onData = (data: Buffer) => {
         buffer += data.toString();
         const readyAt = buffer.indexOf(`${ready}__`);
-        if (readyAt >= 0) {
-          const rest = buffer.slice(readyAt + ready.length + 2);
-          const eol = rest.search(/[\r\n]/);
-          if (eol < 0) return;
-          const reportedShell = rest.slice(0, eol).trim();
-          if (!reportedShell) {
-            finish(new Error('Persistent command worker could not determine the remote login shell'));
-            return;
-          }
-          try {
-            this.shellPath = validateRemotePath(reportedShell, 'Remote login shell');
-          } catch (err) {
-            finish(err instanceof Error ? err : new Error(String(err)));
-            return;
-          }
-          finish();
+        if (readyAt < 0) return;
+
+        const rest = buffer.slice(readyAt + ready.length + 2);
+        const eol = rest.search(/[\r\n]/);
+        if (eol < 0) return;
+        const reportedShell = rest.slice(0, eol).trim();
+        if (!reportedShell || /[\x00-\x1f\x7f]/.test(reportedShell)) {
+          finish(new Error('Persistent command worker reported an invalid remote shell'));
           return;
         }
-        if (buffer.includes(unsupported)) {
-          finish(new Error('Persistent command worker requires a POSIX shell'));
-        }
+        this.shellPath = reportedShell;
+        finish();
       };
-      const onClose = () => finish(new Error('Persistent command worker shell closed during handshake'));
+      const onClose = () => finish(new Error(
+        'Persistent command worker requires a POSIX shell; worker closed during startup',
+      ));
       const onError = (err: Error) => finish(err);
       const timer = setTimeout(
-        () => finish(new Error('Persistent command worker POSIX handshake timed out')),
+        () => finish(new Error('Persistent command worker POSIX startup timed out')),
         HANDSHAKE_TIMEOUT_MS,
       );
       timer.unref();
 
+      // No stdin round-trip is required for readiness. This matters on servers
+      // where a newly-opened non-PTY exec channel accepts the command but delays
+      // or mishandles the first client->server data packet; the bootstrap itself
+      // emits READY before entering its read loop.
       this.stream.on('data', onData);
       this.stream.once('close', onClose);
       this.stream.once('error', onError);
-      this.stream.write(
-        `__sshmcp_shell="\${SHELL:-}"; ` +
-        `if [ -z "$__sshmcp_shell" ]; then __sshmcp_name="\${0#-}"; ` +
-        `__sshmcp_shell="$(command -v "$__sshmcp_name" 2>/dev/null || true)"; fi; ` +
-        `if [ -n "$__sshmcp_shell" ] && [ -x "$__sshmcp_shell" ]; then ` +
-        `printf '%s__%s\\n' '${ready}' "$__sshmcp_shell"; ` +
-        `else printf '%s\\n' '${unsupported}'; fi\n`,
-      );
     });
 
     timingLog('ssh.worker.handshake', {
