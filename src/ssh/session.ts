@@ -113,7 +113,12 @@ export abstract class Session {
   }
 
   abstract run(command: string, timeoutMs?: number, abortSignal?: AbortSignal): Promise<CommandResult>;
+  abstract readOutput(lines?: number): string;
   abstract close(): Promise<CloseOutcome>;
+
+  writeInput(_input: string): void {
+    throw new Error(`${this.type} sessions do not accept interactive input`);
+  }
 
   markDisconnected(): void {
     if (this._status === 'active') {
@@ -138,6 +143,11 @@ export abstract class Session {
 export class InteractiveSession extends Session {
   private stream: ClientChannel;
   private cwd = '~';
+  private ringBuffer: string[] = [];
+  private ringBytes = 0;
+  private ringMax = 10_000;
+  /** Tail of the last chunk when it did not end on a line boundary. */
+  private partialLine = '';
 
   constructor(
     id: string,
@@ -150,9 +160,73 @@ export class InteractiveSession extends Session {
   ) {
     super(id, name, profile, 'interactive', ttlMs);
     this.stream = stream;
+    // Keep a bounded raw tail in addition to the per-run marker parser. This is
+    // what makes write-session-input useful for REPLs/debuggers/prompts: callers
+    // can write a line while run() is waiting and independently poll the same
+    // channel's recent output. The marker parser remains authoritative for
+    // run-command completion; this buffer never tries to infer prompts.
+    stream.on('data', (data: Buffer) => this.captureOutput(data));
     stream.on('close', () => {
+      this.flushPartialLine();
       this._status = 'closed';
     });
+  }
+
+  private captureOutput(data: Buffer): void {
+    const text = this.partialLine + data.toString();
+    const lines = text.split('\n');
+    this.partialLine = lines.pop() ?? '';
+    for (const line of lines) {
+      this.ringBuffer.push(line);
+      this.ringBytes += line.length + 1;
+    }
+    this.trimRingBuffer();
+    this.touch();
+  }
+
+  private flushPartialLine(): void {
+    if (!this.partialLine) return;
+    this.ringBuffer.push(this.partialLine);
+    this.ringBytes += this.partialLine.length + 1;
+    this.partialLine = '';
+    this.trimRingBuffer();
+  }
+
+  private trimRingBuffer(): void {
+    let dropCount = 0;
+    let freed = 0;
+    while (
+      this.ringBytes - freed > this.maxOutputBytes &&
+      dropCount < this.ringBuffer.length
+    ) {
+      freed += this.ringBuffer[dropCount].length + 1;
+      dropCount++;
+    }
+    const remaining = this.ringBuffer.length - dropCount;
+    if (remaining > this.ringMax) {
+      const extra = remaining - this.ringMax;
+      for (let i = 0; i < extra; i++) {
+        freed += this.ringBuffer[dropCount + i].length + 1;
+      }
+      dropCount += extra;
+    }
+    if (dropCount > 0) {
+      this.ringBuffer.splice(0, dropCount);
+      this.ringBytes -= freed;
+    }
+  }
+
+  readOutput(lines = 50): string {
+    const all = this.partialLine ? [...this.ringBuffer, this.partialLine] : this.ringBuffer;
+    return all.slice(-lines).join('\n');
+  }
+
+  writeInput(input: string): void {
+    if (this._status !== 'active') {
+      throw new Error(`Session ${this.name} is not active (status: ${this._status})`);
+    }
+    this.stream.write(input);
+    this.touch();
   }
 
   async run(command: string, timeoutMs?: number, abortSignal?: AbortSignal): Promise<CommandResult> {

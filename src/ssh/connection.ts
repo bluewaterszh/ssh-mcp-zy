@@ -6,6 +6,7 @@ import type { Session, CloseOutcome } from './session.js';
 import { SessionManager } from './session-manager.js';
 import type { Span } from '@opentelemetry/api';
 import { tracer } from '../observability/tracer.js';
+import { timingLog } from '../observability/timing.js';
 import { redactText } from '../guard/redactor.js';
 import { shellSingleQuote } from '../guard/sanitizer.js';
 import { openWithRetry } from './channel-retry.js';
@@ -247,10 +248,46 @@ export class SSHConnection {
   }
 
   async exec(rawCommand: string, opts: ExecOpts = {}): Promise<CommandResult> {
-    await this.ensureConnected();
+    const totalStarted = performance.now();
+    const connectStarted = performance.now();
+    try {
+      await this.ensureConnected();
+    } catch (err) {
+      timingLog('ssh.exec', {
+        profile: this.profile.name,
+        outcome: 'connect-error',
+        ensureConnectedMs: Number((performance.now() - connectStarted).toFixed(3)),
+        channelOpenMs: 0,
+        remoteRuntimeMs: 0,
+        totalMs: Number((performance.now() - totalStarted).toFixed(3)),
+      });
+      throw err;
+    }
+    const ensureConnectedMs = performance.now() - connectStarted;
     const command = this.applyWorkdir(rawCommand);
     const timeoutMs = opts.timeoutMs ?? this.profile.timeout;
     const startTime = Date.now();
+    let channelOpenedAt = 0;
+    const channelOpenStarted = performance.now();
+    let timingSettled = false;
+
+    const logExecTiming = (
+      outcome: string,
+      extra: Record<string, string | number | boolean | undefined> = {},
+    ) => {
+      if (timingSettled) return;
+      timingSettled = true;
+      const now = performance.now();
+      timingLog('ssh.exec', {
+        profile: this.profile.name,
+        outcome,
+        ensureConnectedMs: Number(ensureConnectedMs.toFixed(3)),
+        channelOpenMs: Number(((channelOpenedAt || now) - channelOpenStarted).toFixed(3)),
+        remoteRuntimeMs: Number((channelOpenedAt ? now - channelOpenedAt : 0).toFixed(3)),
+        totalMs: Number((now - totalStarted).toFixed(3)),
+        ...extra,
+      });
+    };
 
     const span = tracer.startSpan('ssh.exec');
     span.setAttribute('ssh.host', this.profile.host);
@@ -265,6 +302,7 @@ export class SSHConnection {
         if (!resolved) {
           resolved = true;
           const note = stopAndDescribe(span, 'ssh.timedOut', activeStream);
+          logExecTiming('timeout');
           span.end();
           reject(new Error(`Command timed out after ${timeoutMs}ms${note}`));
         }
@@ -293,6 +331,7 @@ export class SSHConnection {
           if (!resolved) {
             resolved = true;
             clearTimeout(timeoutId);
+            logExecTiming('channel-open-error');
             span.end();
             reject(new Error(`SSH exec error: ${err.message}`));
           }
@@ -318,6 +357,7 @@ export class SSHConnection {
 
         activeStream = stream;
         this.activeChannels++;
+        channelOpenedAt = performance.now();
 
         let stdout = '';
         let stderr = '';
@@ -343,6 +383,7 @@ export class SSHConnection {
             // held a channel until it finished. Closing the channel does not stop
             // it either — only a delivered signal does (#146).
             const note = stopAndDescribe(span, 'ssh.aborted', stream);
+            logExecTiming('aborted-before-execution');
             span.end();
             reject(new Error(`Command aborted before execution${note}`));
             return;
@@ -352,6 +393,7 @@ export class SSHConnection {
               resolved = true;
               clearTimeout(timeoutId);
               const note = stopAndDescribe(span, 'ssh.aborted', stream);
+              logExecTiming('aborted');
               span.end();
               reject(new Error(`Command aborted${note}`));
             }
@@ -383,11 +425,18 @@ export class SSHConnection {
             resolved = true;
             clearTimeout(timeoutId);
             this.lastActivity = new Date();
+            const durationMs = Date.now() - startTime;
+            logExecTiming('closed', {
+              exitCode: code,
+              signal: signal || undefined,
+              stdoutBytes: Buffer.byteLength(stdout),
+              stderrBytes: Buffer.byteLength(stderr),
+            });
             resolve({
               stdout,
               stderr,
               exitCode: code,
-              durationMs: Date.now() - startTime,
+              durationMs,
               profile: this.profile.name,
               signal: signal || undefined,
             });

@@ -45,6 +45,7 @@ export interface Harness {
   client: Client;
   execCalls: ExecCall[];
   auditRecords: any[];
+  sessionInputs: string[];
   /** What the stubbed exec returns; override per test. */
   setExecResult(result: Partial<CommandResult>): void;
   /** Whether the client approves elicitation prompts. */
@@ -69,6 +70,7 @@ export async function createHarness(
   const profile: Profile = { ...testProfile, ...overrides };
   const execCalls: ExecCall[] = [];
   const auditRecords: any[] = [];
+  const sessionInputs: string[] = [];
   let approve = true;
   let closeOutcome: CloseOutcome = 'closed';
   let approvalPrompts = 0;
@@ -98,14 +100,17 @@ export async function createHarness(
     listSessions: () => [...sessions.values()],
     async openSession({ name, type }: any) {
       const session = {
+        type,
         toInfo: () => ({ id: name, name, profile: profile.name, type, status: 'active', createdAt: new Date(), lastActivity: new Date(), ttlMs: 1000 }),
         run: async (command: string) => { execCalls.push({ command }); return makeResult(command); },
         readOutput: () => 'session output line',
+        writeInput: (input: string) => { sessionInputs.push(input); },
       };
       sessions.set(name, session);
       return session;
     },
     async closeSession(name: string): Promise<CloseOutcome> {
+      if (!sessions.has(name)) throw new Error(`Session \"${name}\" not found`);
       sessions.delete(name);
       return closeOutcome;
     },
@@ -150,6 +155,7 @@ export async function createHarness(
     client,
     execCalls,
     auditRecords,
+    sessionInputs,
     setExecResult(result) { execResult = result; },
     setApproval(value) { approve = value; },
     setCloseOutcome(outcome) { closeOutcome = outcome; },

@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { tracer } from '../observability/tracer.js';
+import { timingLog } from '../observability/timing.js';
 import type { ConnectionRegistry } from '../ssh/connection-registry.js';
 import type { PolicyEngine } from '../policy/engine.js';
 import type { AuditStore } from '../audit/store.js';
@@ -232,11 +233,15 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
     opts: AuditedOpts,
     run: (rt: RunContext) => Promise<{ audited: CommandResult; output: ToolResult }>,
   ): Promise<ToolResult> {
+    const totalStarted = performance.now();
     const ctx = makeCtx(opts.extra, opts.profile, opts.session);
     const profileName = defaultProfileName(opts.profile);
     const profile = registry.getProfile(profileName);
     const onProgress = makeProgressSender(opts.extra);
     const abortSignal = opts.extra?.signal;
+    let policyMs = 0;
+    let runMs = 0;
+    let auditMs = 0;
 
     // Sanitization runs inside the try so a rejected (empty, control-char-only,
     // over-length) command still leaves an audit trail — a client probing with
@@ -253,7 +258,9 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
         state.command = effective;
       }
 
+      const policyStarted = performance.now();
       const { conn, evaluation, approver } = await checkPolicyAndApprove(effective, profileName, opts.toolName);
+      policyMs = performance.now() - policyStarted;
       state.evaluation = evaluation;
 
       if (opts.enforceClass && evaluation.commandClass !== opts.enforceClass) {
@@ -272,15 +279,31 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
         );
       }
 
+      const runStarted = performance.now();
       const { audited, output } = await run({
         conn, command: effective, profileName, onProgress, abortSignal, extra: opts.extra,
       });
+      runMs = performance.now() - runStarted;
 
+      const auditStarted = performance.now();
       await auditResult(ctx, profileName, effective, evaluation, audited, approver);
+      auditMs = performance.now() - auditStarted;
       return output;
     } catch (err: any) {
+      const auditStarted = performance.now();
       await auditFailure(ctx, profileName, state, opts.failureClass, err);
+      auditMs += performance.now() - auditStarted;
       throw err;
+    } finally {
+      timingLog('tool', {
+        tool: opts.toolName,
+        profile: profileName,
+        session: opts.session,
+        policyMs: Number(policyMs.toFixed(3)),
+        runMs: Number(runMs.toFixed(3)),
+        auditMs: Number(auditMs.toFixed(3)),
+        totalMs: Number((performance.now() - totalStarted).toFixed(3)),
+      });
     }
   }
 

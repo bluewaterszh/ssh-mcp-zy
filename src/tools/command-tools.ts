@@ -1,9 +1,35 @@
 import { z } from 'zod';
 import { shellSingleQuote } from '../guard/sanitizer.js';
+import { redactText } from '../guard/redactor.js';
 import { TOOL_DESCRIPTIONS as D } from './descriptions.js';
 import { commandOutput, textResult } from './results.js';
 import { PolicyRefusedError, type ToolDeps, type Pipeline } from './pipeline.js';
 import type { CommandResult } from '../types.js';
+
+interface BatchBuffer {
+  blocks: string[];
+  bytes: number;
+  truncated: boolean;
+}
+
+function appendBatchBlock(state: BatchBuffer, block: string, maxBytes: number): void {
+  if (state.truncated) return;
+  const separator = state.blocks.length ? '\n\n' : '';
+  const separatorBytes = Buffer.byteLength(separator);
+  const blockBytes = Buffer.from(block, 'utf8');
+  if (state.bytes + separatorBytes + blockBytes.length <= maxBytes) {
+    state.blocks.push(block);
+    state.bytes += separatorBytes + blockBytes.length;
+    return;
+  }
+
+  const notice = `\n[batch output truncated at ${maxBytes} bytes]`;
+  const available = Math.max(0, maxBytes - state.bytes - separatorBytes - Buffer.byteLength(notice));
+  const prefix = blockBytes.subarray(0, available).toString('utf8');
+  state.blocks.push(prefix + notice);
+  state.bytes = maxBytes;
+  state.truncated = true;
+}
 
 /** Tools that run a command on the remote host. */
 export function registerCommandTools(
@@ -27,6 +53,62 @@ export function registerCommandTools(
         { toolName: 'read-command', failureClass: 'read-only', enforceClass: 'read-only', profile, extra },
         execAndReport(),
       );
+    },
+  );
+
+  // ─── read-batch ─────────────────────────────────────────────────────────
+  server.tool(
+    'read-batch',
+    D["read-batch"],
+    {
+      commands: z.array(z.string()).min(1).max(64).describe('Read-only shell commands to execute sequentially'),
+      profile: z.string().optional().describe('Profile name'),
+      stopOnError: z.boolean().default(true).describe('Stop after the first rejected or failed command'),
+    },
+    { readOnlyHint: true },
+    async ({ commands, profile, stopOnError }, extra) => {
+      const batch: BatchBuffer = { blocks: [], bytes: 0, truncated: false };
+      const maxResponseBytes = registry.getProfile(defaultProfileName(profile)).maxOutputBytes;
+      let failed = false;
+
+      for (let i = 0; i < commands.length; i++) {
+        const command = commands[i];
+        try {
+          const output = await runAudited(
+            command,
+            {
+              toolName: 'read-batch', failureClass: 'read-only',
+              enforceClass: 'read-only', profile, extra,
+            },
+            execAndReport(),
+          );
+          const body = output.content.map((c) => c.text).join('\n') || '(no output)';
+          appendBatchBlock(
+            batch,
+            `[${i + 1}/${commands.length}] ${redactText(command, { entropyScan: true })}\n${body}`,
+            maxResponseBytes,
+          );
+          if (output.isError) {
+            failed = true;
+            if (stopOnError) break;
+          }
+        } catch (err) {
+          failed = true;
+          const message = err instanceof Error ? err.message : String(err);
+          appendBatchBlock(
+            batch,
+            `[${i + 1}/${commands.length}] ${redactText(command, { entropyScan: true })}\n` +
+              `[tool error] ${redactText(message, { entropyScan: true })}`,
+            maxResponseBytes,
+          );
+          if (stopOnError) break;
+        }
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: batch.blocks.join('\n\n') }],
+        ...(failed ? { isError: true } : {}),
+      };
     },
   );
 
@@ -60,6 +142,73 @@ export function registerCommandTools(
           return { audited, output: commandOutput(audited) };
         },
       );
+    },
+  );
+
+  // ─── run-batch ──────────────────────────────────────────────────────────
+  server.tool(
+    'run-batch',
+    D["run-batch"],
+    {
+      commands: z.array(z.string()).min(1).max(64).describe('Shell commands to execute sequentially'),
+      profile: z.string().optional().describe('Profile name'),
+      session: z.string().optional().describe('Exact interactive session name returned by open-session; all commands run in that session'),
+      tty: z.boolean().optional().describe('Allocate a pseudo-terminal for non-session commands'),
+      stopOnError: z.boolean().default(true).describe('Stop after the first rejected or failed command'),
+    },
+    { destructiveHint: true },
+    async ({ commands, profile, session, tty, stopOnError }, extra) => {
+      const batch: BatchBuffer = { blocks: [], bytes: 0, truncated: false };
+      const maxResponseBytes = registry.getProfile(defaultProfileName(profile)).maxOutputBytes;
+      let failed = false;
+
+      for (let i = 0; i < commands.length; i++) {
+        const command = commands[i];
+        try {
+          const output = await runAudited(
+            command,
+            { toolName: 'run-batch', failureClass: 'safe', profile, session, extra },
+            async (rt) => {
+              let audited: CommandResult;
+              if (session) {
+                const sess = rt.conn.getSession(session);
+                if (!sess) throw new Error(`Session "${session}" not found`);
+                audited = await sess.run(rt.command, undefined, rt.abortSignal);
+              } else {
+                audited = await rt.conn.exec(rt.command, {
+                  tty, onProgress: rt.onProgress, abortSignal: rt.abortSignal,
+                });
+              }
+              return { audited, output: commandOutput(audited) };
+            },
+          );
+          const body = output.content.map((c) => c.text).join('\n') || '(no output)';
+          appendBatchBlock(
+            batch,
+            `[${i + 1}/${commands.length}] ${redactText(command, { entropyScan: true })}\n${body}`,
+            maxResponseBytes,
+          );
+          if (output.isError) {
+            failed = true;
+            if (stopOnError) break;
+          }
+        } catch (err) {
+          failed = true;
+          const message = err instanceof Error ? err.message : String(err);
+          appendBatchBlock(
+            batch,
+            `[${i + 1}/${commands.length}] ${redactText(command, { entropyScan: true })}\n` +
+              `[tool error] ${redactText(message, { entropyScan: true })}`,
+            maxResponseBytes,
+          );
+          if (stopOnError) break;
+        }
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: batch.blocks.join('\n\n') }],
+        ...(failed ? { isError: true } : {}),
+      };
     },
   );
 

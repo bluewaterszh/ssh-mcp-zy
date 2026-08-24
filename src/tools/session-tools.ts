@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { sanitizeSessionName } from '../guard/sanitizer.js';
 import { redactText } from '../guard/redactor.js';
-import { BackgroundSession, type CloseOutcome } from '../ssh/session.js';
+import { type CloseOutcome } from '../ssh/session.js';
 import { COULD_NOT_SIGNAL } from '../ssh/channel-signal.js';
 import { TOOL_DESCRIPTIONS as D } from './descriptions.js';
 import { syntheticSuccess, textResult } from './results.js';
@@ -192,21 +192,64 @@ export function registerSessionTools(
     'read-session-output',
     D["read-session-output"],
     {
-      name: z.string().describe('Exact background session name returned by open-session'),
-      lines: z.number().optional().default(50).describe('Number of recent lines to read'),
+      name: z.string().describe('Exact session name returned by open-session'),
+      lines: z.number().int().min(1).max(10_000).default(50).describe('Number of recent lines to read'),
       profile: z.string().optional().describe('Profile name'),
     },
     { readOnlyHint: true },
     async ({ name, lines, profile }) => {
       const conn = await resolveConn(profile);
       const session = conn.getSession(name);
-      if (!session || session.type !== 'background') {
-        return textResult(`Background session "${name}" not found.`);
+      if (!session) return textResult(`Session "${name}" not found.`);
+      return textResult(redactText(session.readOutput(lines), { entropyScan: true }));
+    },
+  );
+
+  // ─── write-session-input ────────────────────────────────────────────────
+  server.tool(
+    'write-session-input',
+    D["write-session-input"],
+    {
+      name: z.string().describe('Exact interactive session name returned by open-session'),
+      input: z.string().describe('One line of terminal input; Enter is appended automatically'),
+      waitMs: z.number().int().min(0).max(5000).default(0).describe(
+        'Optional server-side wait after writing before returning session output; avoids a second MCP roundtrip',
+      ),
+      readLines: z.number().int().min(0).max(1000).default(50).describe(
+        'Recent output lines to return after writing; 0 returns only the write confirmation',
+      ),
+      profile: z.string().optional().describe('Profile name'),
+    },
+    { destructiveHint: true },
+    async ({ name, input, waitMs, readLines, profile }, extra) => {
+      // One policy decision must correspond to one line actually delivered to the
+      // terminal. Allowing embedded newlines would let one tool call smuggle extra
+      // shell commands past the classifier. Leading whitespace remains intact for
+      // REPLs (notably Python); runAudited evaluates the trimmed equivalent.
+      if (/[\r\n\u2028\u2029\x00]/.test(input)) {
+        throw new Error('write-session-input accepts exactly one line; embedded newlines/control NUL are not allowed');
       }
-      if (session instanceof BackgroundSession) {
-        return textResult(redactText(session.readOutput(lines), { entropyScan: true }));
-      }
-      return textResult(`Session "${name}" is not a background session.`);
+
+      return runAudited(
+        input,
+        { toolName: 'write-session-input', failureClass: 'safe', profile, session: name, extra },
+        async (rt) => {
+          const session = rt.conn.getSession(name);
+          if (!session || session.type !== 'interactive') {
+            throw new Error(`Interactive session "${name}" not found`);
+          }
+          session.writeInput(input + '\n');
+          if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+          const tail = readLines > 0
+            ? redactText(session.readOutput(readLines), { entropyScan: true })
+            : '';
+          const confirmation = `Wrote ${Buffer.byteLength(input, 'utf8') + 1} bytes to session "${name}".`;
+          return {
+            audited: syntheticSuccess(rt.profileName),
+            output: textResult(tail ? `${confirmation}\n\n${tail}` : confirmation),
+          };
+        },
+      );
     },
   );
 }

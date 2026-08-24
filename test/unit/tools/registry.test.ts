@@ -20,9 +20,10 @@ describe('MCP tool surface', () => {
     h = await createHarness();
     const { tools } = await h.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'apply-patch', 'close-session', 'list-connections', 'list-sessions', 'open-session',
-      'privileged-command', 'read-command', 'read-session-output',
-      'run-command', 'sftp-download', 'sftp-upload', 'signal-process',
+      'apply-patch', 'close-session', 'edit-file', 'list-connections', 'list-sessions', 'open-session',
+      'privileged-command', 'read-batch', 'read-command', 'read-session-output',
+      'run-batch', 'run-command', 'sftp-download', 'sftp-upload', 'signal-process',
+      'write-session-input',
     ]);
   });
 
@@ -31,7 +32,7 @@ describe('MCP tool surface', () => {
     const { tools } = await h.client.listTools();
     const readOnly = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
     // A mutating tool advertised as read-only invites auto-approval by clients.
-    expect(readOnly).toEqual(['list-connections', 'list-sessions', 'read-command', 'read-session-output', 'sftp-download']);
+    expect(readOnly).toEqual(['list-connections', 'list-sessions', 'read-batch', 'read-command', 'read-session-output', 'sftp-download']);
   });
 });
 
@@ -43,7 +44,7 @@ describe('apply-patch', () => {
 
     expect(res.isError).toBeFalsy();
     const exec = h.execCalls.at(-1)!;
-    expect(exec.command).toBe("git -C '/repo with space' apply --whitespace=nowarn -");
+    expect(exec.command).toBe("git -C '/repo with space' apply --recount --whitespace=nowarn -");
     expect(exec.stdin).toBe(patch);
     expect(exec.command).not.toContain('$HOME');
     expect(textOf(res)).toContain(`Applied patch (${Buffer.byteLength(patch, 'utf8')} bytes)`);
@@ -89,6 +90,48 @@ describe('read-command — enforceClass', () => {
     const res = await call('read-command', { command: 'curl http://169.254.169.254/latest/meta-data/' });
     expect(res.isError).toBe(true);
     expect(h.execCalls).toHaveLength(0);
+  });
+});
+
+describe('batch commands', () => {
+  it('read-batch executes and audits each read independently', async () => {
+    h = await createHarness();
+    const res = await call('read-batch', { commands: ['ls -la', 'pwd'] });
+
+    expect(res.isError).toBeFalsy();
+    expect(h.execCalls.map((c) => c.command)).toEqual(['ls -la', 'pwd']);
+    expect(h.auditRecords.slice(-2).map((r) => r.command)).toEqual(['ls -la', 'pwd']);
+    expect(textOf(res)).toContain('[1/2] ls -la');
+    expect(textOf(res)).toContain('[2/2] pwd');
+  });
+
+  it('read-batch stops before a command that is not read-only', async () => {
+    h = await createHarness();
+    const res = await call('read-batch', { commands: ['ls', 'rm -rf /tmp/x', 'pwd'] });
+
+    expect(res.isError).toBe(true);
+    expect(h.execCalls.map((c) => c.command)).toEqual(['ls']);
+    expect(textOf(res)).toMatch(/tool error|read-only/i);
+  });
+
+  it('run-batch executes sequentially and stops on a remote failure by default', async () => {
+    h = await createHarness();
+    h.setExecResult({ exitCode: 7, stderr: 'boom' });
+    const res = await call('run-batch', { commands: ['echo one', 'echo two'] });
+
+    expect(res.isError).toBe(true);
+    expect(h.execCalls.map((c) => c.command)).toEqual(['echo one']);
+    expect(textOf(res)).toContain('[exit 7]');
+  });
+
+  it('run-batch can continue after failures when requested', async () => {
+    h = await createHarness();
+    h.setExecResult({ exitCode: 3 });
+    const res = await call('run-batch', { commands: ['echo one', 'echo two'], stopOnError: false });
+
+    expect(res.isError).toBe(true);
+    expect(h.execCalls.map((c) => c.command)).toEqual(['echo one', 'echo two']);
+    expect(h.auditRecords.slice(-2).map((r) => r.command)).toEqual(['echo one', 'echo two']);
   });
 });
 
@@ -439,6 +482,35 @@ describe('sessions', () => {
     }));
     const res = await call('read-session-output', { name: actualName, lines: 5 });
     expect(res.isError).toBeFalsy();
+  });
+});
+
+describe('interactive session I/O', () => {
+  it('writes one policy-checked line using the UUID name returned by open-session', async () => {
+    h = await createHarness();
+    const opened = await call('open-session', { name: 'repl', type: 'interactive' });
+    const actualName = sessionNameOf(opened);
+
+    const written = await call('write-session-input', { name: actualName, input: 'continue' });
+    expect(written.isError).toBeFalsy();
+    expect(h.sessionInputs).toEqual(['continue\n']);
+    expect(h.auditRecords.at(-1).command).toBe('continue');
+
+    const output = await call('read-session-output', { name: actualName, lines: 5 });
+    expect(textOf(output)).toContain('session output line');
+  });
+
+  it('rejects embedded newlines so one policy check cannot deliver multiple shell lines', async () => {
+    h = await createHarness();
+    const opened = await call('open-session', { name: 'repl', type: 'interactive' });
+    const actualName = sessionNameOf(opened);
+
+    const res = await call('write-session-input', {
+      name: actualName,
+      input: 'echo safe\nrm -rf /tmp/hidden',
+    });
+    expect(res.isError).toBe(true);
+    expect(h.sessionInputs).toHaveLength(0);
   });
 });
 

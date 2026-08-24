@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { startE2E, e2eAvailable, textOf } from './harness.js';
 
-// §5 of the readiness report: exercise all 12 tools through a real MCP client
+// §5 of the readiness report: exercise all 16 tools through a real MCP client
 // over a real transport against a real SSH server. This is the check that would
 // have caught open-session being registered without a handler — the in-process
 // harness found it, but only because it too went through the MCP layer.
@@ -22,12 +22,13 @@ function sessionNameOf(result: any): string {
 }
 
 describe.skipIf(!available)('E2E — tool surface over stdio', () => {
-  it('advertises all 12 tools to a real client', async () => {
+  it('advertises all 16 tools to a real client', async () => {
     const { tools } = await e2e.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'apply-patch', 'close-session', 'list-connections', 'list-sessions', 'open-session',
-      'privileged-command', 'read-command', 'read-session-output',
-      'run-command', 'sftp-download', 'sftp-upload', 'signal-process',
+      'apply-patch', 'close-session', 'edit-file', 'list-connections', 'list-sessions', 'open-session',
+      'privileged-command', 'read-batch', 'read-command', 'read-session-output',
+      'run-batch', 'run-command', 'sftp-download', 'sftp-upload', 'signal-process',
+      'write-session-input',
     ]);
   });
 
@@ -98,6 +99,66 @@ describe.skipIf(!available)('E2E — tool surface over stdio', () => {
     const out = await e2e.callTool('read-session-output', { name: sessionName, lines: 10 });
     expect(textOf(out)).toContain('first-line');
 
+    await e2e.callTool('close-session', { name: sessionName });
+  }, 30000);
+
+  it('read-batch and run-batch amortize multiple commands in one MCP call', async () => {
+    const read = await e2e.callTool('read-batch', { commands: ['pwd', 'whoami'] });
+    expect(read.isError).toBeFalsy();
+    expect(textOf(read)).toContain('[1/2] pwd');
+    expect(textOf(read)).toContain('[2/2] whoami');
+
+    const run = await e2e.callTool('run-batch', {
+      commands: ['printf batch-one', 'printf batch-two'], stopOnError: true,
+    });
+    expect(run.isError).toBeFalsy();
+    expect(textOf(run)).toContain('batch-one');
+    expect(textOf(run)).toContain('batch-two');
+  }, 30000);
+
+  it('edit-file validates exact replacements across multiple files before writing', async () => {
+    const a = '/tmp/e2e-edit-a.txt';
+    const b = '/tmp/e2e-edit-b.txt';
+    await e2e.callTool('run-command', { command: `printf 'alpha old\\n' > ${a}; printf 'beta old\\n' > ${b}` });
+
+    const checked = await e2e.callTool('edit-file', {
+      edits: [
+        { path: a, oldText: 'alpha old', newText: 'alpha new' },
+        { path: b, oldText: 'beta old', newText: 'beta new' },
+      ],
+      check: true,
+    });
+    expect(checked.isError).toBeFalsy();
+
+    const before = await e2e.callTool('read-command', { command: `cat ${a} ${b}` });
+    expect(textOf(before)).toContain('alpha old');
+    expect(textOf(before)).toContain('beta old');
+
+    const applied = await e2e.callTool('edit-file', {
+      edits: [
+        { path: a, oldText: 'alpha old', newText: 'alpha new' },
+        { path: b, oldText: 'beta old', newText: 'beta new' },
+      ],
+    });
+    expect(applied.isError).toBeFalsy();
+    const after = await e2e.callTool('read-command', { command: `cat ${a} ${b}` });
+    expect(textOf(after)).toContain('alpha new');
+    expect(textOf(after)).toContain('beta new');
+
+    await e2e.callTool('run-command', { command: `rm -f ${a} ${b}` });
+  }, 30000);
+
+  it('interactive session input can wait briefly and return recent output in the same call', async () => {
+    const opened = await e2e.callTool('open-session', { name: 'e2e-input', type: 'interactive' });
+    const sessionName = sessionNameOf(opened);
+    const res = await e2e.callTool('write-session-input', {
+      name: sessionName,
+      input: 'echo interactive-ok',
+      waitMs: 150,
+      readLines: 10,
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('interactive-ok');
     await e2e.callTool('close-session', { name: sessionName });
   }, 30000);
 

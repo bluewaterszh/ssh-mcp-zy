@@ -131,7 +131,7 @@ claude mcp add --transport stdio ssh-mcp -- ssh-mcp
 
 ---
 
-## Tools (12)
+## Tools (16)
 
 | Tool | Purpose | readOnly | destructive |
 |------|---------|:--------:|:----------:|
@@ -139,14 +139,18 @@ claude mcp add --transport stdio ssh-mcp -- ssh-mcp
 | `list-sessions` | List active sessions per host | ✅ | — |
 | `open-session` | Create a named interactive (stateful) or background session | — | — |
 | `close-session` | Close a session. A background session's command is signalled (INT/TERM/KILL) before its channel is dropped | — | ✅ |
-| `read-session-output` | Read output from background sessions (e.g., `tail -f`) | ✅ | — |
+| `read-session-output` | Read recent output from interactive or background sessions | ✅ | — |
 | `read-command` | Execute allowlisted read-only commands (`ls`, `cat`, `grep`, ...) | ✅ | — |
+| `read-batch` | Run up to 64 read-only commands in one MCP call; each is checked/audited separately | ✅ | — |
 | `run-command` | Execute arbitrary commands (destructive ones need approval) | — | — |
+| `run-batch` | Run up to 64 commands in one MCP call; each is checked/audited separately | — | — |
 | `privileged-command` | Execute with sudo (always requires approval) | — | ✅ |
 | `apply-patch` | Apply a unified Git patch; patch bytes travel over SSH stdin, not shell quoting | — | ✅ |
+| `edit-file` | Exact oldText→newText replacements, including multi-file batches and dry-run checking | — | ✅ |
 | `sftp-upload` | Upload a file via SFTP | — | ✅ |
 | `sftp-download` | Download a file via SFTP | ✅ | — |
 | `signal-process` | Send INT/TERM/KILL to a remote PID | — | ✅ |
+| `write-session-input` | Write one line to an interactive session; optionally wait and return recent output in the same call | — | ✅ |
 
 ### Interactive Sessions
 
@@ -154,10 +158,11 @@ Sessions maintain state (CWD, environment variables) between commands:
 
 ```
 Agent: open-session(name="deploy", type="interactive")
-Agent: run-command(session="deploy", command="cd /opt/myapp")
-Agent: run-command(session="deploy", command="git pull")    # runs in /opt/myapp
-Agent: run-command(session="deploy", command="npm ci")      # CWD persists
-Agent: close-session(name="deploy")
+Server: Session "deploy-<uuid>" opened ...
+Agent: run-command(session="deploy-<uuid>", command="cd /opt/myapp")
+Agent: run-command(session="deploy-<uuid>", command="git pull")    # runs in /opt/myapp
+Agent: run-command(session="deploy-<uuid>", command="npm ci")      # CWD persists
+Agent: close-session(name="deploy-<uuid>")
 ```
 
 ### Background Sessions
@@ -166,8 +171,17 @@ Long-running processes (logs, builds):
 
 ```
 Agent: open-session(name="logs", type="background", command="tail -f /var/log/syslog")
-Agent: read-session-output(name="logs", lines=20)   # poll
-Agent: close-session(name="logs")
+Server: Session "logs-<uuid>" opened ...
+Agent: read-session-output(name="logs-<uuid>", lines=20)   # poll
+Agent: close-session(name="logs-<uuid>")
+```
+
+### Performance timing
+
+Set `SSH_MCP_TIMING=1` to emit per-call timing diagnostics to stderr. It is disabled by default and does not write to the audit log. The timing records split tool execution into policy, remote run, audit, and total time; SSH exec records also include connection reuse, channel-open, and remote-runtime time.
+
+```bash
+SSH_MCP_TIMING=1 ssh-mcp ...
 ```
 
 ### Remote host support
