@@ -37,7 +37,7 @@ export function registerCommandTools(
     {
       command: z.string().describe('Shell command to execute'),
       profile: z.string().optional().describe('Profile name'),
-      session: z.string().optional().describe('Run in an existing interactive session (stateful)'),
+      session: z.string().optional().describe('Exact interactive session name returned by open-session (stateful)'),
       tty: z.boolean().optional().describe('Allocate a pseudo-terminal'),
     },
     { destructiveHint: true },

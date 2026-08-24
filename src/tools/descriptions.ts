@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 export const TOOL_DESCRIPTIONS: Record<string, string> = {
   'list-connections': 'List all configured SSH profiles and their connection status. Use this to discover available hosts before running commands.',
   'list-sessions': 'List active sessions for a given SSH profile.',
-  'open-session': 'Open a named session on a remote host. Use type="interactive" for stateful shell (CWD/env persists between commands) or type="background" for long-running processes.',
+  'open-session': 'Open a named session on a remote host. The server appends a UUID to the requested name; use the exact returned name for later calls. Use type="interactive" for stateful shell (CWD/env persists between commands) or type="background" for long-running processes.',
   'close-session': 'Close a named session. A background session\'s command is signalled on the host (INT, then TERM, then KILL) before its channel is dropped; an interactive session\'s shell is ended. The response says so if the command could not be signalled or had not stopped in time.',
   'read-session-output': 'Read recent output from a background session (e.g., tail -f logs).',
   'read-command': 'Execute a READ-ONLY command from an allowlist (ls, cat, grep, find, stat, df, etc.). This tool does NOT modify the system. Prefer this tool for all read operations.',

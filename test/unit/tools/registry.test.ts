@@ -9,6 +9,12 @@ async function call(name: string, args: Record<string, unknown> = {}) {
   return h.client.callTool({ name, arguments: args }) as Promise<any>;
 }
 
+function sessionNameOf(result: any): string {
+  const match = textOf(result).match(/Session \"([^\"]+)\" opened/);
+  if (!match) throw new Error(`open-session result did not contain a session name: ${textOf(result)}`);
+  return match[1];
+}
+
 describe('MCP tool surface', () => {
   it('exposes exactly the documented tools', async () => {
     h = await createHarness();
@@ -341,93 +347,97 @@ describe('command quota', () => {
 });
 
 describe('sessions', () => {
-  it('opens, lists and closes a session, auditing the open', async () => {
+  it('opens, lists and closes a UUID-suffixed session, auditing the actual name', async () => {
     h = await createHarness();
     const opened = await call('open-session', { name: 'work', type: 'interactive' });
     expect(opened.isError).toBeFalsy();
-    // Opening a stateful shell is a security-relevant event and must be audited.
-    expect(h.auditRecords.at(-1).command).toContain('session:open');
+    const actualName = sessionNameOf(opened);
+    expect(actualName).toMatch(/^work-[0-9a-f-]{36}$/);
+    expect(actualName.length).toBeLessThanOrEqual(64);
+    expect(h.auditRecords.at(-1).command).toContain(`session:open interactive ${actualName}`);
 
     const listed = await call('list-sessions', {});
-    expect(textOf(listed)).toContain('work');
+    expect(textOf(listed)).toContain(actualName);
 
-    const closed = await call('close-session', { name: 'work' });
+    const closed = await call('close-session', { name: actualName });
     expect(closed.isError).toBeFalsy();
-    // And the close, too. Closing a *background* session signals its command on the host —
-    // INT, then TERM, then KILL — and this tool used to reach the connection directly,
-    // around the pipeline, so a caller-invoked SIGKILL on a production host produced no
-    // audit row at all. Every other path to a remote signal is audited.
-    expect(h.auditRecords.at(-1).command).toBe('session:close interactive work');
+    expect(h.auditRecords.at(-1).command).toBe(`session:close interactive ${actualName}`);
   });
 
-  it('audits closing a background session, recording its kind', async () => {
+  it('gives concurrent clients using the same prefix distinct actual names', async () => {
     h = await createHarness();
-    await call('open-session', { name: 'logs', type: 'background', command: 'tail -f /var/log/syslog' });
-    const closed = await call('close-session', { name: 'logs' });
+    const first = sessionNameOf(await call('open-session', { name: 'work', type: 'interactive' }));
+    const second = sessionNameOf(await call('open-session', { name: 'work', type: 'interactive' }));
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^work-[0-9a-f-]{36}$/);
+    expect(second).toMatch(/^work-[0-9a-f-]{36}$/);
+    await call('close-session', { name: first });
+    await call('close-session', { name: second });
+  });
+
+  it('audits closing a background session, recording its actual UUID name and kind', async () => {
+    h = await createHarness();
+    const actualName = sessionNameOf(await call('open-session', {
+      name: 'logs', type: 'background', command: 'tail -f /var/log/syslog',
+    }));
+    const closed = await call('close-session', { name: actualName });
     expect(closed.isError).toBeFalsy();
     const record = h.auditRecords.at(-1);
-    // The kind is in the recorded command so a remote SIGKILL is greppable and is not
-    // indistinguishable from ending a local shell.
-    expect(record.command).toBe('session:close background logs');
-    // Asserted rather than implied. An earlier version of this test was titled "as
-    // destructive" and asserted only `decision`, while the recorded class was `safe` — so
-    // it passed for the opposite of its stated reason. `session:close` is not matched by
-    // any destructive pattern; the release is audited, not gated, and `ruleId` says so.
+    expect(record.command).toBe(`session:close background ${actualName}`);
     expect(record.commandClass).toBe('safe');
     expect(record.ruleId).toBe('session-release');
     expect(record.decision).toBe('allow');
     expect(record.exitCode).toBe(0);
   });
 
-  it('closes the session even on a profile whose policy refuses "safe" commands', async () => {
-    // The regression this shape exists to prevent: routing the close through the policy
-    // gate let a readOnly profile *open* a background session (a `tail -f` classifies
-    // read-only) and then be denied permission to close it, with no other way to stop the
-    // command. A release is audited, never refused.
+  it('closes the UUID-named session even on a profile whose policy refuses "safe" commands', async () => {
     h = await createHarness({ readOnly: true });
-    await call('open-session', { name: 'logs', type: 'background', command: 'tail -f /var/log/syslog' });
-    const closed = await call('close-session', { name: 'logs' });
+    const actualName = sessionNameOf(await call('open-session', {
+      name: 'logs', type: 'background', command: 'tail -f /var/log/syslog',
+    }));
+    const closed = await call('close-session', { name: actualName });
     expect(closed.isError).toBeFalsy();
-    expect(h.auditRecords.at(-1).command).toBe('session:close background logs');
+    expect(h.auditRecords.at(-1).command).toBe(`session:close background ${actualName}`);
 
     const listed = await call('list-sessions', {});
-    expect(textOf(listed)).not.toContain('logs');
+    expect(textOf(listed)).not.toContain(actualName);
   });
 
   it.each([
     ['unsignalled', /could not be signalled/],
     ['stop-unconfirmed', /had not closed in time/],
   ] as const)('tells the caller when a %s close may have left the command running', async (outcome, expected) => {
-    // The whole point of the outcome: `close-session` must not answer "closed." when the
-    // stop was never dispatched, or was dispatched and never took. Both arms were dead
-    // before the harness could express them.
     h = await createHarness();
     h.setCloseOutcome(outcome);
-    await call('open-session', { name: 'logs', type: 'background', command: 'tail -f /var/log/syslog' });
-    const closed = await call('close-session', { name: 'logs' });
+    const actualName = sessionNameOf(await call('open-session', {
+      name: 'logs', type: 'background', command: 'tail -f /var/log/syslog',
+    }));
+    const closed = await call('close-session', { name: actualName });
     expect(textOf(closed)).toMatch(expected);
-    // And recorded, not just told to the model: an unsignalled close used to produce a
-    // byte-identical audit row to a successful one.
     expect(h.auditRecords.at(-1).exitCode).toBe(1);
   });
 
   it('says nothing extra when the stop is confirmed', async () => {
     h = await createHarness();
-    await call('open-session', { name: 'logs', type: 'background', command: 'tail -f /var/log/syslog' });
-    const closed = await call('close-session', { name: 'logs' });
-    expect(textOf(closed)).toBe('Session "logs" closed.');
+    const actualName = sessionNameOf(await call('open-session', {
+      name: 'logs', type: 'background', command: 'tail -f /var/log/syslog',
+    }));
+    const closed = await call('close-session', { name: actualName });
+    expect(textOf(closed)).toBe(`Session "${actualName}" closed.`);
   });
 
-  it('rejects a session name with shell metacharacters', async () => {
+  it('rejects a session name prefix with shell metacharacters', async () => {
     h = await createHarness();
     const res = await call('open-session', { name: 'a; rm -rf /', type: 'interactive' });
     expect(res.isError).toBe(true);
   });
 
-  it('redacts secrets in background session output', async () => {
+  it('redacts secrets in background session output using the returned actual name', async () => {
     h = await createHarness();
-    await call('open-session', { name: 'logs', type: 'background', command: 'tail -f /var/log/syslog' });
-    const res = await call('read-session-output', { name: 'logs', lines: 5 });
+    const actualName = sessionNameOf(await call('open-session', {
+      name: 'logs', type: 'background', command: 'tail -f /var/log/syslog',
+    }));
+    const res = await call('read-session-output', { name: actualName, lines: 5 });
     expect(res.isError).toBeFalsy();
   });
 });

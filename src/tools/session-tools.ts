@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { randomUUID } from 'crypto';
 import { sanitizeSessionName } from '../guard/sanitizer.js';
 import { redactText } from '../guard/redactor.js';
 import { BackgroundSession, type CloseOutcome } from '../ssh/session.js';
@@ -39,6 +40,16 @@ const CLOSE_NOTES: Record<CloseOutcome, string> = {
   'stop-unconfirmed':
     ' The command was signalled but the channel had not closed in time, so it may still be running on the host.',
 };
+
+function uniqueSessionName(requested: string): string {
+  const base = sanitizeSessionName(requested);
+  const suffix = randomUUID();
+  // Session names are capped at 64 characters. A UUID is 36 chars, plus the
+  // separator, leaving 27 chars for the caller-supplied human-readable prefix.
+  // UUIDs are generated before SessionManager sees the request, so concurrent
+  // clients using the same prefix still open distinct, reachable sessions.
+  return `${base.slice(0, 27)}-${suffix}`;
+}
 
 export function registerSessionTools(
   { server, registry }: ToolDeps,
@@ -89,7 +100,10 @@ export function registerSessionTools(
     'open-session',
     D["open-session"],
     {
-      name: z.string().describe('Session name (alphanumeric, dash, underscore, max 64 chars)'),
+      name: z.string().describe(
+        'Human-readable session name prefix (alphanumeric, dash, underscore, max 64 chars). ' +
+        'The server appends a UUID; use the exact returned name for later session calls.',
+      ),
       type: z.enum(['interactive', 'background']).default('interactive').describe('Session type'),
       command: z.string().optional().describe('Command for background sessions'),
       profile: z.string().optional().describe('Profile name (uses default if omitted)'),
@@ -100,7 +114,7 @@ export function registerSessionTools(
     // callback slot instead — leaving this tool registered with no handler and
     // failing every call with "cb is not a function".
     async ({ name, type, command, profile }, extra) => {
-      const cleanName = sanitizeSessionName(name);
+      const cleanName = uniqueSessionName(name);
       const isBackground = type === 'background' && Boolean(command);
 
       // A background session runs a caller-supplied command, so that command is
@@ -125,7 +139,7 @@ export function registerSessionTools(
           });
           return {
             audited: syntheticSuccess(rt.profileName),
-            output: textResult(`Session "${cleanName}" opened on ${rt.conn.profile.name} (${type}).`),
+            output: textResult(`Session "${cleanName}" opened on ${rt.conn.profile.name} (${type}). Use this exact name for later session calls.`),
           };
         },
       );
@@ -137,7 +151,7 @@ export function registerSessionTools(
     'close-session',
     D["close-session"],
     {
-      name: z.string().describe('Session name to close'),
+      name: z.string().describe('Exact session name returned by open-session'),
       profile: z.string().optional().describe('Profile name'),
     },
     { destructiveHint: true },
@@ -178,7 +192,7 @@ export function registerSessionTools(
     'read-session-output',
     D["read-session-output"],
     {
-      name: z.string().describe('Background session name'),
+      name: z.string().describe('Exact background session name returned by open-session'),
       lines: z.number().optional().default(50).describe('Number of recent lines to read'),
       profile: z.string().optional().describe('Profile name'),
     },

@@ -15,6 +15,12 @@ beforeAll(async () => {
 
 afterAll(async () => { await e2e?.cleanup(); });
 
+function sessionNameOf(result: any): string {
+  const match = textOf(result).match(/Session \"([^\"]+)\" opened/);
+  if (!match) throw new Error(`open-session result did not contain a session name: ${textOf(result)}`);
+  return match[1];
+}
+
 describe.skipIf(!available)('E2E — tool surface over stdio', () => {
   it('advertises all 12 tools to a real client', async () => {
     const { tools } = await e2e.client.listTools();
@@ -63,34 +69,36 @@ describe.skipIf(!available)('E2E — tool surface over stdio', () => {
   it('interactive sessions keep CWD and environment between commands', async () => {
     const opened = await e2e.callTool('open-session', { name: 'e2e-shell', type: 'interactive' });
     expect(opened.isError).toBeFalsy();
+    const sessionName = sessionNameOf(opened);
 
-    await e2e.callTool('run-command', { session: 'e2e-shell', command: 'cd /tmp' });
-    await e2e.callTool('run-command', { session: 'e2e-shell', command: 'export E2E_VAR=persisted' });
+    await e2e.callTool('run-command', { session: sessionName, command: 'cd /tmp' });
+    await e2e.callTool('run-command', { session: sessionName, command: 'export E2E_VAR=persisted' });
 
-    const pwd = await e2e.callTool('run-command', { session: 'e2e-shell', command: 'pwd' });
+    const pwd = await e2e.callTool('run-command', { session: sessionName, command: 'pwd' });
     expect(textOf(pwd).trim()).toBe('/tmp');
 
-    const env = await e2e.callTool('run-command', { session: 'e2e-shell', command: 'echo $E2E_VAR' });
+    const env = await e2e.callTool('run-command', { session: sessionName, command: 'echo $E2E_VAR' });
     expect(textOf(env).trim()).toBe('persisted');
 
     const listed = await e2e.callTool('list-sessions');
-    expect(textOf(listed)).toContain('e2e-shell');
+    expect(textOf(listed)).toContain(sessionName);
 
-    const closed = await e2e.callTool('close-session', { name: 'e2e-shell' });
+    const closed = await e2e.callTool('close-session', { name: sessionName });
     expect(closed.isError).toBeFalsy();
   }, 30000);
 
   it('background sessions stream output that read-session-output can poll', async () => {
     await e2e.callTool('run-command', { command: 'echo first-line > /tmp/e2e-bg.log' });
-    await e2e.callTool('open-session', {
+    const opened = await e2e.callTool('open-session', {
       name: 'e2e-bg', type: 'background', command: 'tail -f /tmp/e2e-bg.log',
     });
+    const sessionName = sessionNameOf(opened);
 
     await new Promise((r) => setTimeout(r, 800));
-    const out = await e2e.callTool('read-session-output', { name: 'e2e-bg', lines: 10 });
+    const out = await e2e.callTool('read-session-output', { name: sessionName, lines: 10 });
     expect(textOf(out)).toContain('first-line');
 
-    await e2e.callTool('close-session', { name: 'e2e-bg' });
+    await e2e.callTool('close-session', { name: sessionName });
   }, 30000);
 
   it('sftp-upload and sftp-download round-trip a file', async () => {
@@ -110,14 +118,15 @@ describe.skipIf(!available)('E2E — tool surface over stdio', () => {
     // The process reports its own PID before exec'ing sleep, so the test does
     // not have to pattern-match a process list — `pgrep -f "sleep 120"` also
     // matches the shell running the pgrep, which made this flaky and wrong.
-    await e2e.callTool('open-session', {
+    const opened = await e2e.callTool('open-session', {
       name: 'e2e-victim',
       type: 'background',
       command: 'sh -c \'echo PID=$$; exec sleep 120\'',
     });
+    const sessionName = sessionNameOf(opened);
     await new Promise((r) => setTimeout(r, 800));
 
-    const out = await e2e.callTool('read-session-output', { name: 'e2e-victim', lines: 5 });
+    const out = await e2e.callTool('read-session-output', { name: sessionName, lines: 5 });
     const pid = parseInt(textOf(out).match(/PID=(\d+)/)?.[1] ?? '');
     expect(pid).toBeGreaterThan(0);
 
@@ -131,7 +140,7 @@ describe.skipIf(!available)('E2E — tool surface over stdio', () => {
     const gone = await e2e.callTool('run-command', { command: `sh -c "kill -0 ${pid} 2>/dev/null || echo gone"` });
     expect(textOf(gone)).toContain('gone');
 
-    await e2e.callTool('close-session', { name: 'e2e-victim' }).catch(() => {});
+    await e2e.callTool('close-session', { name: sessionName }).catch(() => {});
   }, 30000);
 
   it('serves the connection resource', async () => {
