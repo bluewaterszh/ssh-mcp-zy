@@ -49,8 +49,6 @@ export interface ToolDeps {
   approvalGrantTtlMs?: number;
   /** Maximum patch payload accepted by apply-patch. */
   applyPatchMaxBytes?: number;
-  /** Maximum lifetime of one synchronous command-tool call; undefined = transport has no extra cap. */
-  foregroundCommandMaxMs?: number;
   registry: ConnectionRegistry;
   policy: PolicyEngine;
   audit: AuditStore;
@@ -219,8 +217,6 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
     preCheck?: (cleanCmd: string) => void;
     /** Rewrite what policy evaluates and what runs (the sudo wrapper). */
     wrap?: (cleanCmd: string) => string;
-    /** Override the transport-provided cancellation signal for this audited run. */
-    abortSignal?: AbortSignal;
   }
 
   /**
@@ -242,7 +238,7 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
     const profileName = defaultProfileName(opts.profile);
     const profile = registry.getProfile(profileName);
     const onProgress = makeProgressSender(opts.extra);
-    const abortSignal = opts.abortSignal ?? opts.extra?.signal;
+    const abortSignal = opts.extra?.signal;
     let policyMs = 0;
     let runMs = 0;
     let auditMs = 0;

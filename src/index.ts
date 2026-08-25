@@ -47,13 +47,6 @@ async function main() {
     console.error(`OPA sidecar enabled: ${argv.opaUrl}`);
   }
 
-  const transportMode = argv.transport || 'stdio';
-  // Tunnel commands currently carry a whole-lifecycle response deadline of about
-  // two minutes. Leave enough room for worker cancellation, audit, HTTP framing
-  // and the tunnel response POST so callers get an actionable tool error instead
-  // of an opaque gateway 502. stdio keeps the profile's normal command timeout.
-  const HTTP_FOREGROUND_COMMAND_MAX_MS = 100_000;
-
   // An McpServer binds to a single transport, so HTTP needs one per session.
   const createMcpServer = (): McpServer => {
     // capabilities moved from serverInfo to ServerOptions in SDK 1.30.
@@ -64,11 +57,12 @@ async function main() {
     registerTools(server, registry, policy, audit, {
       approvalGrantTtlMs: config.defaults.approvalGrantTtlMs,
       applyPatchMaxBytes: config.defaults.applyPatchMaxBytes,
-      foregroundCommandMaxMs: transportMode === 'http' ? HTTP_FOREGROUND_COMMAND_MAX_MS : undefined,
     });
     registerResources(server, registry);
     return server;
   };
+
+  const transportMode = argv.transport || 'stdio';
 
   if (transportMode === 'http') {
     const { startHttpServer } = await import('./transport/http.js');

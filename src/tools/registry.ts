@@ -25,11 +25,7 @@ export function registerTools(
   registry: ConnectionRegistry,
   policy: PolicyEngine,
   audit: AuditStore,
-  opts: {
-    approvalGrantTtlMs?: number;
-    applyPatchMaxBytes?: number;
-    foregroundCommandMaxMs?: number;
-  } = {},
+  opts: { approvalGrantTtlMs?: number; applyPatchMaxBytes?: number } = {},
 ) {
   const deps: ToolDeps = { server, registry, policy, audit, ...opts };
   const pipeline = createPipeline(deps);

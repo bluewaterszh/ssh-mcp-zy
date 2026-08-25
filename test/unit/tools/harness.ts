@@ -56,8 +56,6 @@ export interface Harness {
   channelCloseCount(): number;
   /** What the stubbed exec returns; override per test. */
   setExecResult(result: Partial<CommandResult>): void;
-  /** Artificial remote runtime used by timeout/cancellation tests. */
-  setExecDelayMs(ms: number): void;
   /** Whether the client approves elicitation prompts. */
   setApproval(approve: boolean): void;
   /** How many times the client was actually prompted. */
@@ -75,11 +73,7 @@ export interface Harness {
 
 export async function createHarness(
   overrides: Partial<Profile> = {},
-  toolOpts: {
-    approvalGrantTtlMs?: number;
-    applyPatchMaxBytes?: number;
-    foregroundCommandMaxMs?: number;
-  } = {},
+  toolOpts: { approvalGrantTtlMs?: number; applyPatchMaxBytes?: number } = {},
 ): Promise<Harness> {
   const profile: Profile = { ...testProfile, ...overrides };
   const execCalls: ExecCall[] = [];
@@ -96,7 +90,6 @@ export async function createHarness(
   let closeOutcome: CloseOutcome = 'closed';
   let approvalPrompts = 0;
   let execResult: Partial<CommandResult> = {};
-  let execDelayMs = 0;
 
   const makeResult = (command: string): CommandResult => ({
     stdout: `stdout for ${command}`,
@@ -154,22 +147,6 @@ export async function createHarness(
     noteChannelOpened() { channelOpens++; return () => { channelCloses++; }; },
     async exec(command: string, opts: any = {}) {
       execCalls.push({ command, stdin: opts.stdin });
-      if (opts.abortSignal?.aborted) throw new Error('Command aborted before execution');
-      if (execDelayMs > 0) {
-        await new Promise<void>((resolve, reject) => {
-          let settled = false;
-          const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            opts.abortSignal?.removeEventListener('abort', onAbort);
-            err ? reject(err) : resolve();
-          };
-          const onAbort = () => finish(new Error('Command aborted'));
-          const timer = setTimeout(() => finish(), execDelayMs);
-          opts.abortSignal?.addEventListener('abort', onAbort, { once: true });
-        });
-      }
       return makeResult(command);
     },
     getSudoPassword: () => 'sudo-secret',
@@ -246,7 +223,6 @@ export async function createHarness(
     channelOpenCount: () => channelOpens,
     channelCloseCount: () => channelCloses,
     setExecResult(result) { execResult = result; },
-    setExecDelayMs(ms) { execDelayMs = ms; },
     setApproval(value) { approve = value; },
     setCloseOutcome(outcome) { closeOutcome = outcome; },
     approvalPrompts: () => approvalPrompts,
