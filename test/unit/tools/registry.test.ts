@@ -261,6 +261,44 @@ describe('batch commands', () => {
   });
 });
 
+describe('foreground command deadline', () => {
+  it('returns an actionable error before a long foreground command reaches the transport deadline', async () => {
+    h = await createHarness({}, { foregroundCommandMaxMs: 50 });
+    h.setExecDelayMs(200);
+
+    const res = await call('run-command', { command: 'sleep 999' });
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/FOREGROUND_TIMEOUT/i);
+    expect(textOf(res)).toMatch(/open-session.*background/i);
+    expect(h.execCalls.map((c) => c.command)).toEqual(['sleep 999']);
+  });
+
+  it('uses one deadline for the whole batch instead of resetting it per command', async () => {
+    h = await createHarness({}, { foregroundCommandMaxMs: 150 });
+    h.setExecDelayMs(100);
+
+    const res = await call('run-batch', {
+      commands: ['echo one', 'echo two', 'echo three'],
+      stopOnError: false,
+    });
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/FOREGROUND_TIMEOUT/i);
+    expect(h.execCalls.map((c) => c.command)).toEqual(['echo one', 'echo two']);
+  });
+
+  it('does not impose the HTTP foreground cap when the transport did not configure one', async () => {
+    h = await createHarness();
+    h.setExecDelayMs(30);
+
+    const res = await call('run-command', { command: 'echo stdio-style' });
+
+    expect(res.isError).toBeFalsy();
+    expect(h.execCalls.map((c) => c.command)).toEqual(['echo stdio-style']);
+  });
+});
+
 describe('run-command — approval gate', () => {
   it('executes a destructive command once the client approves', async () => {
     h = await createHarness();
