@@ -215,6 +215,19 @@ POSIX-specific, not merely non-`cmd`.
 
 ## Configuration
 
+HTTP transport retains at most **512 MCP sessions**, including initializations in progress.
+Sessions idle for `httpSessionIdleTimeoutMs` (10 minutes by default) are reclaimed even
+when the client does not send DELETE. At capacity, the least recently used idle HTTP
+session is evicted; requests still executing are protected. If every slot is busy or
+initializing, new initialization requests receive HTTP 503. An evicted client receives
+404 on its next request and must initialize a new session.
+
+HTTP session eviction does not close the shared SSH connections or named interactive
+and background sessions. Clients can reuse one MCP session for multiple tool calls;
+clients that are finished should send DELETE rather than only close their HTTP connection.
+The authenticated `GET /status` response includes `httpSessions` counts and LRU/TTL
+reclamation counters for diagnosing session churn.
+
 ### Profile options
 
 ```toml

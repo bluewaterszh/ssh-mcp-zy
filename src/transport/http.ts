@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'http';
 import { randomUUID, timingSafeEqual } from 'crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -9,7 +9,7 @@ import { OperatorError } from '../errors.js';
 
 const DEFAULT_MAX_BODY_SIZE = 16_777_216; // 16MB; configurable via HttpTransportOpts
 /** Cap on concurrent MCP sessions, so unauthenticated-adjacent churn can't grow the map without bound. */
-const MAX_SESSIONS = 64;
+const DEFAULT_MAX_SESSIONS = 512;
 /** Reclaim MCP clients that disappear without sending the protocol DELETE. */
 const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 600_000; // 10 minutes
 
@@ -59,6 +59,8 @@ export interface HttpTransportOpts {
   rateLimit?: number;
   /** Maximum JSON request body size for the MCP route. */
   maxBodyBytes?: number;
+  /** Maximum established plus initializing HTTP sessions. Defaults to 512. */
+  maxSessions?: number;
   /** Idle lifetime for an MCP HTTP session. Active requests are never reaped. */
   sessionIdleTimeoutMs?: number;
   /**
@@ -82,7 +84,7 @@ function jsonRpcError(res: ServerResponse, status: number, code: number, message
 export async function startHttpServer(
   createMcpServer: () => McpServer | Promise<McpServer>,
   opts: HttpTransportOpts,
-): Promise<void> {
+): Promise<Server> {
   const { port, host = '127.0.0.1', bearerToken, registry } = opts;
 
   if (!bearerToken) {
@@ -107,55 +109,86 @@ export async function startHttpServer(
   const maxBodyBytes = opts.maxBodyBytes && opts.maxBodyBytes > 0
     ? opts.maxBodyBytes
     : DEFAULT_MAX_BODY_SIZE;
+  const maxSessions = opts.maxSessions && Number.isSafeInteger(opts.maxSessions) && opts.maxSessions > 0
+    ? opts.maxSessions
+    : DEFAULT_MAX_SESSIONS;
   const sessionIdleTimeoutMs = opts.sessionIdleTimeoutMs && opts.sessionIdleTimeoutMs > 0
     ? opts.sessionIdleTimeoutMs
     : DEFAULT_SESSION_IDLE_TIMEOUT_MS;
   const transports = new Map<string, ManagedTransport>();
+  // Reserve capacity before awaiting the server factory/connect. Otherwise concurrent
+  // initialize requests can all observe spare capacity before their IDs are registered.
+  const initializing = new Set<ManagedTransport>();
+  let lruEvictions = 0;
+  let idleExpirations = 0;
 
-  /**
-   * HTTP connections are request-scoped, so a socket/request close is not evidence that
-   * the MCP session ended. Clients that crash or lose the network may never send DELETE;
-   * without this reaper their entries lived forever and eventually exhausted all 64 slots.
-   */
+  function closeTransport(managed: ManagedTransport): void {
+    initializing.delete(managed);
+    const id = managed.transport.sessionId;
+    if (id && transports.get(id) === managed) transports.delete(id);
+    void managed.transport.close().catch(() => { /* already disconnected */ });
+  }
+
+  /** Reclaim idle clients even if they vanished without sending DELETE. */
   function reapIdleTransports(now = Date.now()): void {
     const cutoff = now - sessionIdleTimeoutMs;
-    for (const [id, managed] of transports) {
+    for (const managed of transports.values()) {
       if (managed.activeRequests > 0 || managed.lastActivity > cutoff) continue;
-      if (transports.get(id) !== managed) continue;
-      transports.delete(id);
-      void managed.transport.close().catch(() => { /* already disconnected */ });
+      idleExpirations++;
+      closeTransport(managed);
     }
   }
 
-  // The timer handles normal cleanup; opportunistic reaping below makes capacity recovery
-  // immediate between timer ticks. unref() keeps housekeeping from extending process life.
+  function touchTransport(managed: ManagedTransport): void {
+    managed.lastActivity = Date.now();
+    const id = managed.transport.sessionId;
+    if (id && transports.get(id) === managed) {
+      // Map order is the LRU order, including accesses in the same millisecond.
+      transports.delete(id);
+      transports.set(id, managed);
+    }
+  }
+
+  /** Capacity pressure may evict only an idle HTTP session, never an in-flight request. */
+  function evictLeastRecentlyUsedIdleTransport(): boolean {
+    for (const managed of transports.values()) {
+      if (managed.activeRequests > 0) continue;
+      lruEvictions++;
+      closeTransport(managed);
+      return true;
+    }
+    return false;
+  }
+
   const reapIntervalMs = Math.min(Math.max(Math.floor(sessionIdleTimeoutMs / 2), 25), 30_000);
   const sessionReaper = setInterval(reapIdleTransports, reapIntervalMs);
   sessionReaper.unref();
 
   function trackRequest(managed: ManagedTransport, res: ServerResponse): () => void {
     managed.activeRequests++;
-    managed.lastActivity = Date.now();
+    touchTransport(managed);
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
       managed.activeRequests = Math.max(0, managed.activeRequests - 1);
-      managed.lastActivity = Date.now();
+      touchTransport(managed);
       res.removeListener('finish', finish);
       res.removeListener('close', finish);
+      // Rejected/abandoned initialization has no registered ID and must release its slot.
+      if (initializing.has(managed)) closeTransport(managed);
     };
     res.once('finish', finish);
     res.once('close', finish);
     return finish;
   }
 
-  /** Route to the session's transport, or start a new session on `initialize`. */
+  /** Pin the transport before yielding, so a concurrent initialize cannot evict it. */
   async function resolveTransport(
     req: IncomingMessage,
     res: ServerResponse,
     parsedBody?: unknown,
-  ): Promise<ManagedTransport | null> {
+  ): Promise<{ transport: StreamableHTTPServerTransport; finishActivity: () => void } | null> {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     reapIdleTransports();
@@ -163,8 +196,7 @@ export async function startHttpServer(
     if (sessionId) {
       const existing = transports.get(sessionId);
       if (existing) {
-        existing.lastActivity = Date.now();
-        return existing;
+        return { transport: existing.transport, finishActivity: trackRequest(existing, res) };
       }
       jsonRpcError(res, 404, -32001, 'Session not found or expired. Re-initialize to obtain a new session.');
       return null;
@@ -176,8 +208,8 @@ export async function startHttpServer(
       return null;
     }
 
-    if (transports.size >= MAX_SESSIONS) {
-      jsonRpcError(res, 503, -32000, `Server is at its session limit (${MAX_SESSIONS}). Close an existing session and retry.`);
+    if (transports.size + initializing.size >= maxSessions && !evictLeastRecentlyUsedIdleTransport()) {
+      jsonRpcError(res, 503, -32000, `Server is at its session limit (${maxSessions}); all sessions are busy or initializing. Retry when a request completes.`);
       return null;
     }
 
@@ -187,22 +219,57 @@ export async function startHttpServer(
       enableDnsRebindingProtection: true,
       allowedHosts,
       onsessioninitialized: (id) => {
+        initializing.delete(managed);
         managed.lastActivity = Date.now();
         transports.set(id, managed);
       },
       onsessionclosed: (id) => { transports.delete(id); },
     });
     managed = { transport, lastActivity: Date.now(), activeRequests: 0 };
-    // Explicit transport teardown is immediate. A vanished client is handled by the idle
-    // reaper above rather than treating an HTTP request close as an MCP session close.
+    initializing.add(managed);
+    const finishActivity = trackRequest(managed, res);
     transport.onclose = () => {
+      initializing.delete(managed);
       const id = transport.sessionId;
       if (id && transports.get(id) === managed) transports.delete(id);
     };
 
-    const mcp = await createMcpServer();
-    await mcp.connect(transport);
-    return managed;
+    try {
+      const mcp = await createMcpServer();
+      if (res.destroyed || res.writableEnded) {
+        finishActivity();
+        await mcp.close();
+        return null;
+      }
+      await mcp.connect(transport);
+      return { transport, finishActivity };
+    } catch (error) {
+      finishActivity();
+      closeTransport(managed);
+      throw error;
+    }
+  }
+
+  async function handleMcpRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    parsedBody?: unknown,
+  ): Promise<void> {
+    let resolved: Awaited<ReturnType<typeof resolveTransport>> = null;
+    try {
+      resolved = await resolveTransport(req, res, parsedBody);
+      if (!resolved) return;
+      if (res.destroyed || res.writableEnded) {
+        resolved.finishActivity();
+        return;
+      }
+      await resolved.transport.handleRequest(req, res, parsedBody);
+    } catch (error) {
+      resolved?.finishActivity();
+      console.error('MCP HTTP request failed:', error);
+      if (!res.headersSent) jsonRpcError(res, 500, -32603, 'MCP HTTP request failed');
+      else res.end();
+    }
   }
 
   const httpServer = createServer(async (req, res) => {
@@ -296,29 +363,13 @@ export async function startHttpServer(
           jsonRpcError(res, 400, -32700, 'Parse error: invalid JSON');
           return;
         }
-        const managed = await resolveTransport(req, res, parsed);
-        if (!managed) return;
-        const finishActivity = trackRequest(managed, res);
-        try {
-          await managed.transport.handleRequest(req, res, parsed);
-        } catch (err) {
-          finishActivity();
-          throw err;
-        }
+        await handleMcpRequest(req, res, parsed);
       });
       return;
     }
 
     if ((req.method === 'GET' || req.method === 'DELETE') && url.pathname === '/') {
-      const managed = await resolveTransport(req, res);
-      if (!managed) return;
-      const finishActivity = trackRequest(managed, res);
-      try {
-        await managed.transport.handleRequest(req, res);
-      } catch (err) {
-        finishActivity();
-        throw err;
-      }
+      await handleMcpRequest(req, res);
       return;
     }
 
@@ -327,6 +378,16 @@ export async function startHttpServer(
       res.end(JSON.stringify({
         status: 'running',
         version: SERVER_VERSION,
+        httpSessions: {
+          limit: maxSessions,
+          established: transports.size,
+          initializing: initializing.size,
+          inFlightRequests: [...transports.values(), ...initializing]
+            .reduce((sum, managed) => sum + managed.activeRequests, 0),
+          idleTimeoutMs: sessionIdleTimeoutMs,
+          lruEvictions,
+          idleExpirations,
+        },
         connections: registry.listConnections(),
         profiles: registry.listAllProfiles().map((p) => ({
           name: p.name,
@@ -349,7 +410,10 @@ export async function startHttpServer(
     res.end(JSON.stringify({ error: 'Not found' }));
   });
 
-  httpServer.once('close', () => clearInterval(sessionReaper));
+  httpServer.once('close', () => {
+    clearInterval(sessionReaper);
+    for (const managed of [...transports.values(), ...initializing]) closeTransport(managed);
+  });
 
   // Previously listen() had no error handler, so EADDRINUSE surfaced as an
   // unhandled 'error' event and a raw stack — and startHttpServer resolved
@@ -376,4 +440,5 @@ export async function startHttpServer(
       resolve();
     });
   });
+  return httpServer;
 }
