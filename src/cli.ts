@@ -209,13 +209,16 @@ export async function buildAppConfig(argv: Record<string, string | null>): Promi
     approvalMode: 'ask-destructive',
   };
 
+  const sudoOption = argv.sudo === undefined
+    ? process.env.SSH_MCP_SUDO || 'false'
+    : argv.sudo;
   const profile: Profile = {
     name: 'default',
     host: argv.host,
     port: parseInt(argv.port as string) || 22,
     user: argv.user,
     auth: argv.key ? 'key' : 'password',
-    sudo: flagEnabled(argv, 'sudo'),
+    sudo: flagEnabled({ sudo: sudoOption }, 'sudo'),
     keyRef: argv.key || undefined,
     workdir: argv.workdir || undefined,
     tty: false,

@@ -307,7 +307,20 @@ variable. The remote account must have sudo permission to start a root shell.
 The profile's role/group binding must allow `privileged`, with `readOnly = false`
 and an `approvalPolicy` other than `deny`. Existing command policies and approvals
 still apply. For a CLI-only configuration, `--sudo` enables this mode and
-`--sudo=false` disables it. SFTP, upload/download, and SFTP-based file edits use
+`--sudo=false` disables it. Launchers that forward environment variables can
+set `SSH_MCP_SUDO=true` (or `1`) instead; `false`, `0`, or an empty value disables
+it. An explicit `--sudo` option takes precedence. A loaded TOML configuration
+uses its own per-profile `sudo` setting.
+
+For a DevSpace `.env` loaded by `devspace-tunnelctl.sh`:
+
+```dotenv
+SSH_MCP_SUDO='true'
+SSH_MCP_SUDO_PASSWORD='your-sudo-password'
+```
+
+For passwordless sudo, omit the password variable or leave it empty.
+SFTP, upload/download, and SFTP-based file edits use
 the SSH login user's permissions. Root file operations can use command tools.
 
 ### ProxyJump (Bastion)
