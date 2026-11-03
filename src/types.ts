@@ -9,6 +9,8 @@ export interface Profile {
   port: number;
   user: string;
   auth: AuthMethod;
+  /** Run commands and sessions as root after SSH authentication. */
+  sudo?: boolean;
   keyRef?: string;
   keychainEntry?: string;
   via?: string;
@@ -84,6 +86,7 @@ export interface ConnectionInfo {
   host: string;
   port: number;
   user: string;
+  executionUser?: string;
   status: ConnectionStatus;
   sessionCount: number;
   activeChannels: number;
@@ -176,6 +179,7 @@ export interface AuditRecord {
   mcpRequestId: string | number;
   profile: string;
   user: string;
+  executionUser?: string;
   command: string;
   commandClass: CommandClass;
   binary: string;

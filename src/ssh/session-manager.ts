@@ -4,6 +4,7 @@ import { InteractiveSession, BackgroundSession, stripAnsi, type Session , type C
 import { shellSingleQuote } from '../guard/sanitizer.js';
 import { openWithRetry } from './channel-retry.js';
 import { randomUUID } from 'crypto';
+import { startSudoChannel } from './sudo-channel.js';
 
 /**
  * How the manager reaches the SSH connection.
@@ -90,6 +91,7 @@ export class SessionManager {
     );
     this.register(name, session, stream);
     try {
+      startSudoChannel(stream);
       await this.primeShell(stream, session);
     } catch (err) {
       await session.close().catch(() => { /* channel already going away */ });
@@ -171,6 +173,13 @@ export class SessionManager {
       id, name, profile.name, stream, ttlMs, profile.sessionBackgroundMaxMs, profile.maxOutputBytes,
     );
     this.register(name, session, stream);
+    try {
+      startSudoChannel(stream);
+    } catch (err) {
+      await session.close().catch(() => {});
+      this.sessions.delete(name);
+      throw err;
+    }
     return session;
   }
 

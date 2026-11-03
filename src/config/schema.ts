@@ -48,6 +48,7 @@ export const profileSchema = z.object({
   port: z.number().int().min(1).max(65535).default(22),
   user: z.string().min(1),
   auth: authMethodSchema.default('agent'),
+  sudo: z.boolean().default(false),
   keyRef: z.string().optional(),
   keychainEntry: z.string().optional(),
   via: z.string().optional(),

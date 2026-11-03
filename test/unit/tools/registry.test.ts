@@ -295,6 +295,24 @@ describe('run-command — approval gate', () => {
 });
 
 describe('privileged-command', () => {
+  it('uses the elevated connection without passing a second password to application stdin', async () => {
+    h = await createHarness({ sudo: true });
+    const res = await call('privileged-command', { command: 'cat' });
+    expect(res.isError).toBeFalsy();
+    expect(h.execCalls).toEqual([{ command: 'cat', stdin: undefined }]);
+    expect(h.approvalPrompts()).toBe(1);
+    expect(JSON.stringify(h.auditRecords)).not.toContain('sudo-secret');
+    expect(h.auditRecords.at(-1)).toMatchObject({ user: 'tester', executionUser: 'root' });
+  });
+
+  it('still honors a declined privileged approval on an elevated profile', async () => {
+    h = await createHarness({ sudo: true });
+    h.setApproval(false);
+    const res = await call('privileged-command', { command: 'id' });
+    expect(res.isError).toBe(true);
+    expect(h.execCalls).toHaveLength(0);
+  });
+
   it('pipes the sudo password over stdin, never in the command line', async () => {
     h = await createHarness();
     const res = await call('privileged-command', { command: 'systemctl restart nginx' });
@@ -367,6 +385,18 @@ describe('output redaction', () => {
 });
 
 describe('audit records', () => {
+  it('records root command execution and the login identity for SFTP on an elevated profile', async () => {
+    h = await createHarness({ sudo: true });
+    await call('read-command', { command: 'ls -la' });
+    expect(h.auditRecords.at(-1)).toMatchObject({ user: 'tester', executionUser: 'root' });
+    await call('sftp-upload', { remotePath: '/tmp/file.txt', content: 'before' });
+    expect(h.auditRecords.at(-1)).toMatchObject({ user: 'tester', executionUser: 'tester' });
+    await call('edit-file', {
+      edits: [{ path: '/tmp/file.txt', oldText: 'before', newText: 'after' }],
+    });
+    expect(h.auditRecords.at(-1)).toMatchObject({ user: 'tester', executionUser: 'tester' });
+  });
+
   it('records an allowed command as allowed', async () => {
     h = await createHarness();
     await call('read-command', { command: 'ls -la' });

@@ -1,3 +1,5 @@
+import { SudoAuthenticationError } from './sudo-channel.js';
+
 /**
  * Retry opening an SSH channel a couple of times before giving up.
  *
@@ -33,6 +35,7 @@ export async function openWithRetry<T>(
     try {
       return await open();
     } catch (err) {
+      if (err instanceof SudoAuthenticationError) throw err;
       lastError = err;
       if (attempt < attempts) {
         await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));

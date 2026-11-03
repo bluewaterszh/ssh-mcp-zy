@@ -64,7 +64,7 @@ const REMOVED_V1_FLAGS: Record<string, string> = {
   password: 'Use the SSH_MCP_PASSWORD env var (or a per-profile SSH_MCP_<PROFILE>_PASSWORD).',
   suPassword: 'Use the SSH_MCP_SUDO_PASSWORD env var.',
   sudoPassword: 'Use the SSH_MCP_SUDO_PASSWORD env var.',
-  disableSudo: 'Sudo is now a separate tool; restrict it with a role/policy that disallows the "privileged" class.',
+  disableSudo: 'Use --sudo=false for automatic elevation, and role/policy bindings to restrict the "privileged" class.',
 };
 
 export function checkRemovedFlags(argv: Record<string, string | null>): void {
@@ -215,6 +215,7 @@ export async function buildAppConfig(argv: Record<string, string | null>): Promi
     port: parseInt(argv.port as string) || 22,
     user: argv.user,
     auth: argv.key ? 'key' : 'password',
+    sudo: flagEnabled(argv, 'sudo'),
     keyRef: argv.key || undefined,
     workdir: argv.workdir || undefined,
     tty: false,

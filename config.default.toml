@@ -30,8 +30,13 @@ port = 2222
 user = "developer"
 auth = "agent"                    # agent | key | password | keychain
 role = "admin"
+sudo = false                     # Opt in to root commands/sessions via sudo
 readOnly = false
 approvalPolicy = "auto"           # dev is permissive
+
+# sudo = true requires a role/group binding that allows "privileged".
+# Set SSH_MCP_<PROFILE>_SUDO_PASSWORD in the MCP process environment when needed.
+# Passwordless sudo also works. SFTP and file-edit tools use the SSH login user.
 
 # Production web server — strict
 [[profiles]]

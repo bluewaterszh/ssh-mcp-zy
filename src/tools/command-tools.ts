@@ -223,6 +223,7 @@ export function registerCommandTools(
     { destructiveHint: true },
     async ({ command, profile }, extra) => {
       const profileName = defaultProfileName(profile);
+      let executionCommand = command;
       return runAudited(
         command,
         {
@@ -233,6 +234,7 @@ export function registerCommandTools(
           // Evaluate the bare command too: the sudo wrapper would otherwise
           // hide a forbidden command inside a quoted `sh -c` argument.
           preCheck: (cleanCmd) => {
+            executionCommand = cleanCmd;
             const rawEval = policy.evaluate(cleanCmd, registry.getProfile(profileName), 'privileged-command');
             if (rawEval.decision === 'deny') {
               throw new PolicyRefusedError(
@@ -243,7 +245,16 @@ export function registerCommandTools(
           },
           wrap: (cleanCmd) => `sudo -p "" -S sh -c ${shellSingleQuote(cleanCmd)}`,
         },
-        (rt) => {
+        async (rt) => {
+          if (rt.conn.profile.sudo) {
+            // Policy still checks the privileged wrapper, but the connection
+            // already supplies root. Sending a second password here could
+            // expose it to the application's stdin under NOPASSWD.
+            const audited = await rt.conn.exec(executionCommand, {
+              onProgress: rt.onProgress, abortSignal: rt.abortSignal,
+            });
+            return { audited, output: commandOutput(audited) };
+          }
           const sudoPassword = rt.conn.getSudoPassword();
           return execAndReport({ stdin: sudoPassword ? sudoPassword + '\n' : undefined })(rt);
         },

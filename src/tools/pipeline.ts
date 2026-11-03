@@ -128,10 +128,12 @@ export function createPipeline({ server, registry, policy, audit, approvalGrantT
     result: CommandResult | { error: string },
     approver?: string,
   ) {
+    const profile = registry.getProfile(profileName);
     await audit.record({
       mcpRequestId: ctx.requestId,
       profile: profileName,
-      user: registry.getProfile(profileName).user,
+      user: profile.user,
+      ...(profile.sudo ? { executionUser: command.startsWith('sftp:') ? profile.user : 'root' } : {}),
       command,
       commandClass: evaluation.commandClass,
       binary: evaluation.binary,

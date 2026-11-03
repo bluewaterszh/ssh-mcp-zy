@@ -70,7 +70,8 @@ export function registerSessionTools(
         const conn = connections.find((c) => c.profile === p.name);
         const status = conn?.status || 'disconnected';
         const sessions = conn?.sessionCount || 0;
-        return `${p.name}: ${p.user}@${p.host}:${p.port} [${status}] sessions=${sessions} role=${p.role}`;
+        const execution = p.sudo ? ' executionUser=root' : '';
+        return `${p.name}: ${p.user}@${p.host}:${p.port} [${status}] sessions=${sessions} role=${p.role}${execution}`;
       });
       return textResult(lines.join('\n'));
     },

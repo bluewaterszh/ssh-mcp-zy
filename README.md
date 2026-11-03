@@ -253,6 +253,7 @@ host = "10.0.1.50"
 port = 22
 user = "deploy"
 auth = "agent"                      # agent | key | password | keychain
+sudo = false                        # root commands/sessions after SSH login (see below)
 keyRef = "~/.ssh/id_ed25519"        # for auth=key
 keychainEntry = "ssh-mcp/prod"      # for auth=keychain (requires @napi-rs/keyring)
 via = "bastion"                     # ProxyJump — route through bastion profile
@@ -287,6 +288,27 @@ leave you running defaults you thought you had overridden. That extends to role
 and tier names: every one you write under `[policy.roleBindings]` has to be
 reachable by some profile, and every profile's role and tier has to resolve to
 real bindings. Both directions are checked at startup.
+
+### Automatic sudo
+
+Set `sudo = true` on a Linux/POSIX profile to run commands, interactive sessions,
+and background sessions as root after authenticating SSH with the profile's
+`user`. The MCP server handles sudo authentication and reuses the elevated
+command worker. Each new channel, including channels after reconnecting,
+authenticates before executing its command. Authentication failure closes the
+channel and returns an error.
+
+Set `SSH_MCP_<NAME>_SUDO_PASSWORD` in the MCP process environment, or use the
+fallback `SSH_MCP_SUDO_PASSWORD`. Uppercase the profile name and replace
+non-alphanumeric characters with underscores. The password is supplied through
+SSH stdin only when sudo requests it. Passwordless sudo works without this
+variable. The remote account must have sudo permission to start a root shell.
+
+The profile's role/group binding must allow `privileged`, with `readOnly = false`
+and an `approvalPolicy` other than `deny`. Existing command policies and approvals
+still apply. For a CLI-only configuration, `--sudo` enables this mode and
+`--sudo=false` disables it. SFTP, upload/download, and SFTP-based file edits use
+the SSH login user's permissions. Root file operations can use command tools.
 
 ### ProxyJump (Bastion)
 
@@ -648,6 +670,7 @@ Secrets are **never** passed as CLI arguments.
 | `--key` | — | Quick start: Path to private key |
 | `--workdir` | — | Quick start: Working directory for commands and sessions |
 | `--group` | prod | Quick start: Policy tier — `prod`, `staging` or `dev` |
+| `--sudo` | false | Quick start: Automatically execute commands and sessions as root via sudo |
 | `--timeout` | 1800000 | Command timeout in ms (30min) |
 | `--maxChars` | none | Max command length (`none` or `0` disables the limit; config: `commandMaxChars = 0`) |
 | `--maxOutputBytes` | 8388608 | Command and session output-buffer cap |

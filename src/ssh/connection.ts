@@ -12,6 +12,7 @@ import { shellSingleQuote, validateRemotePath } from '../guard/sanitizer.js';
 import { openWithRetry } from './channel-retry.js';
 import { terminateChannel, COULD_NOT_SIGNAL } from './channel-signal.js';
 import { CommandWorker, COMMAND_WORKER_BOOTSTRAP } from './command-worker.js';
+import { openSudoChannel, startSudoChannel } from './sudo-channel.js';
 
 /**
  * Stop the command behind `channel`, record why on the span, and return the sentence the
@@ -113,6 +114,11 @@ export class SSHConnection {
       // re-ran a corpse three times. SftpClient already did it this way.
       openShell: async () => {
         await this.ensureConnected();
+        if (this.profile.sudo) {
+          return this.openExecChannel('exec "${SHELL:-/bin/sh}" -i', {
+            pty: { term: 'xterm-256color', cols: 200, rows: 50 },
+          });
+        }
         return new Promise<ClientChannel>((resolve, reject) => {
           this.getClient().shell(
             { term: 'xterm-256color', cols: 200, rows: 50 },
@@ -122,12 +128,7 @@ export class SSHConnection {
       },
       openExec: async (command) => {
         await this.ensureConnected();
-        return new Promise<ClientChannel>((resolve, reject) => {
-          this.getClient().exec(
-            this.applyWorkdir(command),
-            (err, stream) => (err ? reject(err) : resolve(stream)),
-          );
-        });
+        return this.openExecChannel(this.applyWorkdir(command));
       },
       onChannelOpened: () => this.noteChannelOpened(),
     });
@@ -299,6 +300,29 @@ export class SSHConnection {
     return `cd ${shellSingleQuote(workdir)} && ${command}`;
   }
 
+  /** All command channels enter the configured execution identity before use. */
+  private async openExecChannel(
+    command: string,
+    options: ExecOptions = {},
+    abortSignal?: AbortSignal,
+  ): Promise<ClientChannel> {
+    const client = this.getClient();
+    if (this.profile.sudo) {
+      const releaseChannel = this.noteChannelOpened();
+      try {
+        return await openSudoChannel(client, command, options, this.credentials.sudoPassword, {
+          timeoutMs: Math.min(this.profile.timeout, 15_000),
+          abortSignal,
+        });
+      } finally {
+        releaseChannel();
+      }
+    }
+    return new Promise<ClientChannel>((resolve, reject) => {
+      client.exec(command, options, (err, stream) => err ? reject(err) : resolve(stream));
+    });
+  }
+
   /**
    * A normal ssh2 exec channel is one-shot. On the measured OpenSSH target,
    * opening the next channel costs ~1.8s even though the command itself takes
@@ -315,7 +339,7 @@ export class SSHConnection {
       !opts.tty && !this.profile.tty && opts.stdin === undefined &&
       !hasStandaloneBackgroundOperator(rawCommand)
     ) {
-      const worker = await this.getOrCreateCommandWorker();
+      const worker = await this.getOrCreateCommandWorker(opts.abortSignal);
       const workdir = this.profile.workdir
         ? validateRemotePath(this.profile.workdir, 'Profile workdir')
         : undefined;
@@ -329,11 +353,11 @@ export class SSHConnection {
     return this.execDirect(rawCommand, opts);
   }
 
-  private async getOrCreateCommandWorker(): Promise<CommandWorker | null> {
+  private async getOrCreateCommandWorker(abortSignal?: AbortSignal): Promise<CommandWorker | null> {
     if (this.commandWorker) return this.commandWorker;
     if (this.commandWorkerUnsupported || this.commandWorkerOpening) return null;
 
-    const opening = this.openCommandWorker();
+    const opening = this.openCommandWorker(abortSignal);
     this.commandWorkerOpening = opening;
     try {
       return await opening;
@@ -342,7 +366,7 @@ export class SSHConnection {
     }
   }
 
-  private async openCommandWorker(): Promise<CommandWorker | null> {
+  private async openCommandWorker(abortSignal?: AbortSignal): Promise<CommandWorker | null> {
     const generation = Symbol('command-worker');
     this.commandWorkerGeneration = generation;
     const started = performance.now();
@@ -358,10 +382,7 @@ export class SSHConnection {
       }
       stream = await openWithRetry(async () => {
         await this.ensureConnected();
-        const client = this.getClient();
-        return new Promise<ClientChannel>((resolve, reject) => {
-          client.exec(COMMAND_WORKER_BOOTSTRAP, {}, (err, channel) => err ? reject(err) : resolve(channel));
-        });
+        return this.openExecChannel(COMMAND_WORKER_BOOTSTRAP, {}, abortSignal);
       });
     } catch (err) {
       if (this.commandWorkerGeneration === generation) {
@@ -374,11 +395,14 @@ export class SSHConnection {
         totalMs: Number((performance.now() - started).toFixed(3)),
         error: err instanceof Error ? err.message : String(err),
       });
+      // A failed elevation must not trigger another password attempt or run
+      // the command through the ordinary-user fallback.
+      if (this.profile.sudo) throw err;
       return null;
     }
 
     try {
-      const worker = await CommandWorker.create(
+      const readyWorker = CommandWorker.create(
         stream,
         this.profile.name,
         this.profile.maxOutputBytes,
@@ -391,6 +415,14 @@ export class SSHConnection {
         },
         () => this.noteChannelOpened(),
       );
+      try {
+        startSudoChannel(stream);
+      } catch (err) {
+        stream.destroy();
+        await readyWorker.catch(() => {});
+        throw err;
+      }
+      const worker = await readyWorker;
       if (this.commandWorkerGeneration !== generation) {
         worker.close();
         return null;
@@ -414,6 +446,7 @@ export class SSHConnection {
         totalMs: Number((performance.now() - started).toFixed(3)),
         error: err instanceof Error ? err.message : String(err),
       });
+      if (this.profile.sudo) throw err;
       return null;
     }
   }
@@ -500,10 +533,7 @@ export class SSHConnection {
         // Re-established per attempt: the refusal can be a dropped connection
         // rather than a refused channel.
         await this.ensureConnected();
-        const activeClient = this.getClient();
-        return new Promise<ClientChannel>((res, rej) => {
-          activeClient.exec(command, execOpts, (err, stream) => (err ? rej(err) : res(stream)));
-        });
+        return this.openExecChannel(command, execOpts, opts.abortSignal);
       };
 
       const onExecChannel = (err: Error | undefined, stream: ClientChannel) => {
@@ -544,11 +574,6 @@ export class SSHConnection {
         const maxOutput = this.profile.maxOutputBytes;
         let lastProgressSent = 0;
         const PROGRESS_INTERVAL = 500;
-
-        if (opts.stdin) {
-          try { stream.write(opts.stdin); } catch { /* */ }
-        }
-        try { stream.end(); } catch { /* */ }
 
         if (opts.abortSignal) {
           if (opts.abortSignal.aborted) {
@@ -627,6 +652,23 @@ export class SSHConnection {
             span.end();
           }
         });
+
+        // Authentication and application input have separate phases. Attach
+        // output listeners before releasing the root bootstrap's GO gate.
+        try {
+          startSudoChannel(stream);
+          if (opts.stdin) stream.write(opts.stdin);
+          stream.end();
+        } catch (error) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutId);
+            stopAndDescribe(span, 'ssh.aborted', stream);
+            logExecTiming('channel-input-error');
+            span.end();
+            reject(error);
+          }
+        }
       };
 
       openWithRetry(openExecChannel).then(
@@ -678,6 +720,7 @@ export class SSHConnection {
       host: this.profile.host,
       port: this.profile.port,
       user: this.profile.user,
+      ...(this.profile.sudo ? { executionUser: 'root' } : {}),
       status: this.isConnected() ? 'connected' : 'closed',
       sessionCount: this.sessions.size,
       activeChannels: this.activeChannels,

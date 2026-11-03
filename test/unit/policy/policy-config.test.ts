@@ -336,6 +336,37 @@ describe('mergePolicyRules', () => {
  * These cases are the cross-check that closes that, in both directions.
  */
 describe('startup coherence', () => {
+  it.each([
+    ['group = "prod"', /privileged/],
+    ['group = "dev"\nreadOnly = true', /readOnly/],
+    ['group = "dev"\napprovalPolicy = "deny"', /approvalPolicy/],
+  ])('rejects automatic sudo with incompatible policy %s', async (settings, message) => {
+    const config = await loadConfig(await writeConfig(`
+[[profiles]]
+name = "elevated"
+host = "localhost"
+user = "deploy"
+role = "admin"
+sudo = true
+${settings}
+`));
+    expect(() => engineFor(config)).toThrow(message);
+  });
+
+  it('allows automatic sudo on an explicitly authorized profile and retains command approval', async () => {
+    const config = await loadConfig(await writeConfig(`
+${ADMIN_PROD_PROFILE}
+sudo = true
+
+[policy.roleBindings.admin]
+prod = ["read-only", "safe", "destructive", "privileged"]
+`));
+    const policy = engineFor(config);
+    const profile = getProfile(config, 'prod-web');
+    expect(policy.evaluate('ls -la', profile, 'read-command').decision).toBe('allow');
+    expect(policy.evaluate('rm -rf /tmp/build', profile, 'run-command').decision).toBe('require-approval');
+  });
+
   it('rejects a profile whose group nothing defines', async () => {
     const config = await loadConfig(await writeConfig(`
 [[profiles]]

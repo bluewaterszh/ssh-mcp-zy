@@ -39,6 +39,24 @@ auth = "password"
     expect(config.profiles[0].name).toBe('dev');
     expect(config.profiles[0].port).toBe(2222);
     expect(config.profiles[0].sessionMaxPerConnection).toBe(5);
+    expect(config.profiles[0].sudo).toBe(false);
+  });
+
+  it('enables automatic sudo only on the configured profile', async () => {
+    const config = await loadConfig(await writeConfig(`
+[[profiles]]
+name = "elevated"
+host = "localhost"
+user = "deploy"
+sudo = true
+
+[[profiles]]
+name = "regular"
+host = "localhost"
+user = "deploy"
+`));
+    expect(getProfile(config, 'elevated').sudo).toBe(true);
+    expect(getProfile(config, 'regular').sudo).toBe(false);
   });
 
   // Regression: [defaults] used to be validated but only two session keys were

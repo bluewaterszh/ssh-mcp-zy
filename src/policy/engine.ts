@@ -144,6 +144,14 @@ export function findPolicyProblems(
     }
 
     const group = resolveProfileGroup(profile);
+    if (profile.sudo && (
+      profile.readOnly || profile.approvalPolicy === 'deny' || !roleBinding[group]?.includes('privileged')
+    )) {
+      problems.push(
+        `profile "${profile.name}": sudo = true requires readOnly = false, an approvalPolicy other than "deny", ` +
+        `and the "privileged" class for role "${profile.role}" on group "${group}".`,
+      );
+    }
     if (roleBinding[group]) continue;
 
     const tiers = Object.keys(roleBinding).join(', ');
